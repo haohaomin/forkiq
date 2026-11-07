@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS repositories(
   full_name TEXT NOT NULL UNIQUE,
   upstream_full_name TEXT,
   branch TEXT NOT NULL DEFAULT 'main',
-  mode TEXT NOT NULL DEFAULT 'mirror',
+  mode TEXT NOT NULL DEFAULT 'safe',
   enabled INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'pending',
   upstream_sha TEXT,
@@ -145,6 +145,11 @@ class DB:
         for name, kind in (("restore_backup_id", "INTEGER"), ("restore_expected_sha", "TEXT")):
             if name not in columns:
                 conn.execute(f"ALTER TABLE repositories ADD COLUMN {name} {kind}")
+        # Legacy mirror rows now only fast-forward. Legacy custom forks must
+        # never start merging automatically after upgrading this installation.
+        conn.execute("UPDATE repositories SET mode='safe' WHERE mode='mirror'")
+        conn.execute("UPDATE repositories SET mode='protected', enabled=0, status='paused', "
+                     "sync_requested=0, self_update_interval=NULL WHERE mode='manual'")
         conn.commit()
 
     def run(self, sql, params=()):
@@ -167,6 +172,24 @@ class DB:
         self.run("INSERT INTO settings(key,value) VALUES(?,?) "
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
+    def setup_admin(self, password_hash):
+        """Atomically claim first-run setup, so two public clients cannot race."""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM settings WHERE key='setup_done' AND value='1'").fetchone():
+                conn.rollback()
+                return False
+            conn.execute("INSERT INTO settings(key,value) VALUES('admin_pass_hash',?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (password_hash,))
+            conn.execute("INSERT INTO settings(key,value) VALUES('setup_done','1') "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
 
 def log_event(db, repo_id, kind, message):
     db.run("INSERT INTO events(repo_id, at, kind, message) VALUES(?,?,?,?)",
@@ -178,7 +201,7 @@ def insert_repository(db, *, owner, name, full_name, upstream_full_name, branch=
     now = utcnow()
     cur = db.run(
         "INSERT INTO repositories(owner,name,full_name,upstream_full_name,branch,node_id,"
-        "status,discovered,is_archived,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "status,discovered,is_archived,created_at,updated_at,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,'safe')",
         (owner, name, full_name, upstream_full_name, branch, node_id, status,
          discovered, is_archived, now, now))
     return cur.lastrowid
