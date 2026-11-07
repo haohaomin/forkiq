@@ -129,7 +129,8 @@
     const count = document.querySelector('#bulk-count');
     const help = document.querySelector('#bulk-selection-help');
     const action = document.querySelector('#bulk-action');
-    const preview = document.querySelector('#bulk-preview');
+    const actionButtons = [...bulkForm.querySelectorAll('[data-bulk-action]')];
+    let preview = null;
     const confirm = bulkDialog?.querySelector('[data-bulk-confirm]');
     const checks = () => [...document.querySelectorAll('[data-repo-select]')];
     const selected = () => checks().filter(input => input.checked && !input.disabled);
@@ -160,10 +161,9 @@
       selectAll.disabled = !available.length;
       clear.disabled = !chosen.length;
       count.textContent = chosen.length ? `已选择 ${chosen.length} 个仓库` : '未选择仓库';
-      action.disabled = !chosen.length;
-      preview.disabled = !chosen.length || !labels[action.value] || chosen.length > 500;
+      actionButtons.forEach(button => { button.disabled = !chosen.length || chosen.length > 500; });
       help.textContent = chosen.length ? '选择期间暂停列表自动刷新；提交时会重新检查状态。每次最多 500 个仓库。' :
-        '仅操作勾选的仓库，每次最多 500 个；切换筛选会清空选择。';
+        '选中仓库后点击操作，预览确认后执行；每次最多 500 个。';
       // Changing the operation alone must not freeze refresh after selection is cleared.
       delete bulkForm.dataset.editing;
     };
@@ -185,9 +185,10 @@
         } else updateSelection();
       }
     });
-    action.addEventListener('change', updateSelection);
     let approved = false;
     bulkForm.addEventListener('submit', event => {
+      preview = event.submitter;
+      action.value = preview?.dataset.bulkAction || '';
       if (bulkForm.dataset.submitting || !selected().length || !labels[action.value] || selected().length > 500) {
         event.preventDefault();
         return;
@@ -229,7 +230,7 @@
         approved = true;
         bulkForm.requestSubmit(preview);
       });
-      bulkDialog.addEventListener('close', () => preview.focus());
+      bulkDialog.addEventListener('close', () => preview?.focus());
     }
     updateSelection();
   }

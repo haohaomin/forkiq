@@ -209,18 +209,26 @@ tr:hover td { background: var(--surface); }
 .repo-search-query { flex: 1; }
 .repo-search label { margin: 0; font-size: 12px; color: var(--muted); }
 .content .repo-search input[type="search"] { width: 100%; max-width: none; margin-top: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--card); font: inherit; }
-.repo-search select, .bulk-form select { min-height: 42px; padding: 8px 10px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 6px; font: inherit; }
-.repo-search select { width: 100%; margin-top: 6px; }
+.repo-mode-options { min-width: 0; margin: 0; padding: 0; border: 0; }
+.repo-mode-options legend { margin-bottom: 6px; padding: 0; color: var(--muted); font-size: 12px; }
+.mode-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.content .mode-chip { margin: 0; cursor: pointer; }
+.mode-chip span { display: block; padding: 9px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--muted); font-size: 13px; line-height: 22px; white-space: nowrap; }
+.mode-chip:hover span { color: var(--primary); border-color: var(--primary); }
+.mode-chip input:checked + span { color: var(--primary); border-color: var(--primary); background: var(--primary-soft); }
+.mode-chip input:focus-visible + span { outline: 1px dashed var(--muted); outline-offset: 3px; }
+.repo-mode-options input:focus-visible { outline: none; }
+.repo-search :is(input[type="search"], button):focus-visible, .bulk-toolbar :is(button, input):focus-visible { outline: 1px dashed var(--muted); outline-offset: 3px; }
 .content .repo-search > button { margin: 0; min-height: 42px; }
 .clear-filters { padding: 9px 0; font-size: 12px; }
-.bulk-toolbar { position: sticky; top: var(--header-height); z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: -4px -4px 20px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: var(--shadow); }
+.bulk-toolbar { position: sticky; top: var(--header-height); z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: -4px 0 20px; padding: 12px 0 16px; border-bottom: 1px solid var(--line); background: var(--card); }
 .bulk-selection { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; flex: 1; font-size: 12px; }
 .content .select-visible { display: inline-flex; align-items: center; gap: 8px; margin: 0; min-height: 36px; white-space: nowrap; cursor: pointer; color: var(--ink); }
 #bulk-count { font-variant-numeric: tabular-nums; color: var(--primary); }
 .text-button { padding: 4px 2px; border: 0; background: transparent; color: var(--muted); font-size: 12px; box-shadow: none; }
 .bulk-form { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.bulk-form select { max-width: 240px; min-width: 170px; margin: 0; }
 .content .bulk-form > button { margin: 0; white-space: nowrap; }
+.bulk-form > button:disabled, .bulk-selection > button:disabled { cursor: default; }
 .bulk-toolbar .field-help { flex-basis: 100%; max-width: none; margin: 0; font-size: 11px; }
 .repo-identity { display: flex; align-items: flex-start; gap: 10px; }
 .repo-identity .repo-pair { flex: 1; min-width: 0; }
@@ -242,10 +250,11 @@ tr:hover td { background: var(--surface); }
 @media (max-width: 760px) {
   .repo-search { gap: 10px; }
   .repo-search-query { flex-basis: 100%; }
-  .repo-search > div:not(.repo-search-query) { flex: 1; }
-  .bulk-toolbar { position: static; margin: 0 0 18px; padding: 12px; }
+  .repo-mode-options { flex: 1; }
+  .mode-chips { gap: 6px; }
+  .mode-chip span { padding-inline: 10px; }
+  .bulk-toolbar { position: static; margin: 0 0 18px; padding: 0 0 16px; }
   .bulk-selection, .bulk-form { flex-basis: 100%; }
-  .bulk-form select { flex: 1; min-width: 0; max-width: none; width: 0; }
   .bulk-form button { min-height: 42px; }
   .content .repo-select-label { width: 32px; min-height: 38px; margin-top: -6px; }
   .bulk-preview-list li { flex-wrap: wrap; gap: 4px 10px; }
