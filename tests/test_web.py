@@ -765,6 +765,28 @@ class WebTests(unittest.TestCase):
         remove_form = self.assert_post_form(page, f"/repos/{repo_id}/remove", token)
         self.assertTrue(remove_form["attrs"].get("data-confirm"))
 
+    def test_force_mode_requires_explicit_confirmation_and_preserves_filters(self):
+        token = self.setup_admin()
+        repo_id, _ = self.repository_with_backup()
+        self.main.db.run("UPDATE repositories SET mode='protected',enabled=0,status='paused' WHERE id=?", (repo_id,))
+        path = f"/repos/{repo_id}/mode"
+        data = {"csrf": self.csrf(token), "mode_choice": "force"}
+        with mock.patch.object(self.main.worker, 'request_sync') as wake:
+            self.assertEqual(self.client.post(path, data=data).status_code, 400)
+            wake.assert_not_called()
+            response, page = self.rendered_page(f"/repos/{repo_id}/force-mode")
+            self.assert_post_form(page, path, token)
+            self.assertIn('持续生效', response.text)
+            self.assertEqual(self.main.db.one('SELECT mode FROM repositories WHERE id=?', (repo_id,))['mode'], 'protected')
+            self.assertEqual(self.client.post(path, data={**data, 'confirmation':'force'}).status_code, 302)
+            wake.assert_called_once()
+        row = self.main.db.one('SELECT * FROM repositories WHERE id=?', (repo_id,))
+        self.assertEqual((row['mode'], row['enabled'], row['sync_requested']), ('force', 1, 1))
+        self.assertIn('me/demo', self.client.get('/repos?mode=force').text)
+        self.assertNotIn('me/demo', self.client.get('/repos?mode=safe').text)
+        self.main.db.run('UPDATE repositories SET restore_backup_id=1 WHERE id=?', (repo_id,))
+        self.assertEqual(self.client.post(path, data={**data, 'confirmation':'force'}).status_code, 409)
+
     def test_repository_detail_prioritizes_sync_and_groups_advanced_actions(self):
         token = self.setup_admin()
         from app.db import insert_repository
