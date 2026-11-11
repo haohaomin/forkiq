@@ -1403,6 +1403,40 @@ class WebTests(unittest.TestCase):
         self.assertFalse(any(call[0] in ("update_ref", "merge_commit") for call in stub.calls))
         return repo_id, stub, row
 
+    def test_force_deletion_review_blocks_and_requires_exact_one_use_approval(self):
+        from app.protection import load_review, review_token
+        token = self.setup_admin()
+        for case in ("large", "empty", "incomplete"):
+            with self.subTest(case=case):
+                repo_id, stub, _ = self.dangerous_deletion_review()
+                self.main.db.run("UPDATE repositories SET mode='force', status='pending', enabled=1, "
+                                 "deletion_review=NULL WHERE id=?", (repo_id,))
+                if case == "empty":
+                    stub.file_trees["up/demo", "b" * 40] = set()
+                if case == "incomplete":
+                    stub.tree_errors["up/demo", "b" * 40] = RuntimeError("incomplete tree")
+                observation = stub.nodes["N1"]
+                def row():
+                    return self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))
+                with mock.patch.object(engine, "align_upstream", return_value="synced") as align:
+                    self.assertEqual(engine.sync_one(self.main.db, stub, row(), observation), "needs_attention")
+                    align.assert_not_called()
+                    self.assertEqual(stub.refs["me/demo"], "a" * 40)
+                    self.assertEqual(row()["mode"], "force")
+                    approval = review_token(load_review(row()))
+                    response = self.client.post(f"/repos/{repo_id}/confirm-deletion",
+                                                data={"csrf": self.csrf(token), "review": approval})
+                    if case == "incomplete":
+                        self.assertEqual(response.status_code, 409)
+                        continue
+                    self.assertEqual(response.status_code, 302)
+                    self.assertEqual(engine.sync_one(self.main.db, stub, row(), observation), "synced")
+                    align.assert_called_once()
+                    self.assertIsNone(row()["deletion_approval"])
+                    # A failed/unconfirmed push cannot reuse the consumed approval.
+                    self.assertEqual(engine.sync_one(self.main.db, stub, row(), observation), "needs_attention")
+                    align.assert_called_once()
+
     def backup_record(self, repo_id, full_name="me/demo", fork_sha=None, status="ready",
                       contents=b"isolated backup fixture\n", error=None):
         """Publish an intact local file without invoking Git or GitHub."""

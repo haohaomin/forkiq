@@ -72,19 +72,26 @@ class ForceSyncTests(unittest.TestCase):
         self.assertEqual(self.client.get_ref('me/demo', 'main'), self.target)
         self.assertEqual(self.row()['enabled'], 0)
 
-    def test_engine_routes_only_explicit_force_mode_to_alignment(self):
+    def test_engine_routes_force_mode_through_deletion_guard_before_alignment(self):
         from app import engine
         from test_engine import node
         observation = node('N1', 'me/demo', 'up/demo', self.current, self.target)
-        with mock.patch.object(engine, 'align_upstream', return_value='synced') as align:
+        with mock.patch.object(engine, '_deletion_guard', return_value=False) as guard, \
+             mock.patch.object(engine, 'align_upstream', return_value='synced') as align:
+            self.assertEqual(engine.sync_one(self.db, self.client, self.row(), observation), 'needs_attention')
+            guard.assert_called_once_with(self.db, self.client, self.row(), self.current, self.target)
+            align.assert_not_called()
+        with mock.patch.object(engine, '_deletion_guard', return_value=True) as guard, \
+             mock.patch.object(engine, 'align_upstream', return_value='synced') as align:
             self.assertEqual(engine.sync_one(self.db, self.client, self.row(), observation), 'synced')
+            guard.assert_called_once_with(self.db, self.client, self.row(), self.current, self.target)
             align.assert_called_once()
         self.db.run("UPDATE repositories SET mode='protected',enabled=0 WHERE id=?", (self.repo_id,))
         with mock.patch.object(engine, 'align_upstream') as align:
             self.assertEqual(engine.sync_one(self.db, self.client, self.row(), observation), 'paused')
             align.assert_not_called()
 
-    def test_explicit_force_mode_can_align_to_empty_upstream_tree(self):
+    def test_alignment_transport_can_align_to_empty_upstream_tree_after_review(self):
         remote = '--git-dir=' + str(self.remote)
         empty = self.git(remote, 'hash-object', '-w', '-t', 'tree', '/dev/null')
         self.target_head = self.git(remote, '-c', 'user.name=Upstream', '-c', 'user.email=up@example.invalid',
