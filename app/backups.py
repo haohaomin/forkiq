@@ -91,6 +91,79 @@ def verified_backup(db, record):
         return False
 
 
+def backup_health(db, full_name=None):
+    """Inspect stored snapshots without changing the database or GitHub.
+
+    This is intentionally an on-demand check: hashing a bundle can be
+    expensive, so normal repository pages only show the last backup result.
+    ``healthy`` means the database row and on-disk bundle agree exactly.
+    """
+    result = {
+        "status": "healthy", "message": "备份健康", "total": 0,
+        "healthy": 0, "missing": 0, "corrupt": 0, "pending": 0,
+        "failed": 0, "bytes": 0, "free_bytes": None, "low_space": False,
+        "items": [],
+    }
+    try:
+        root = _root(db)
+    except (OSError, BackupError):
+        rows = db.all("SELECT * FROM repository_backups WHERE full_name=? ORDER BY id DESC", (full_name,)) if full_name else []
+        result.update(status="warning" if rows else "empty",
+                      message="备份目录缺失，尚无可检查的备份" if not rows else "备份目录缺失")
+        result["total"] = len(rows)
+        result["missing"] = sum(row["status"] == "ready" for row in rows)
+        return result
+    try:
+        usage = shutil.disk_usage(root)
+        result["free_bytes"] = usage.free
+        result["low_space"] = usage.free < MIN_FREE_BYTES
+    except OSError:
+        result["status"] = "warning"
+        result["message"] = "无法读取备份磁盘空间"
+    query = "SELECT * FROM repository_backups"
+    params = ()
+    if full_name:
+        query += " WHERE full_name=?"
+        params = (full_name,)
+    rows = db.all(query + " ORDER BY id DESC", params)
+    for row in rows:
+        result["total"] += 1
+        item = {"id": row["id"], "fork_sha": row["fork_sha"], "status": row["status"],
+                "size_bytes": row["size_bytes"] or 0, "state": "healthy", "message": "完整"}
+        if row["status"] == "ready":
+            result["bytes"] += row["size_bytes"] or 0
+            try:
+                path = backup_path(db, row)
+                exists = path.is_file() and not path.is_symlink()
+            except (OSError, BackupError):
+                exists = False
+            if not exists:
+                result["missing"] += 1
+                item.update(state="missing", message="文件缺失或不是普通文件")
+            elif verified_backup(db, row):
+                result["healthy"] += 1
+            else:
+                result["corrupt"] += 1
+                item.update(state="corrupt", message="大小或 SHA-256 校验失败")
+        elif row["status"] == "building":
+            result["pending"] += 1
+            item.update(state="pending", message="正在生成")
+        else:
+            result["failed"] += 1
+            item.update(state="failed", message=row["last_error"] or "备份失败")
+        result["items"].append(item)
+    if result["low_space"]:
+        result["status"] = "warning"
+        result["message"] = "备份磁盘剩余空间低于 256 MiB"
+    elif result["missing"] or result["corrupt"] or result["pending"] or result["failed"]:
+        result["status"] = "warning"
+        result["message"] = "发现备份异常，请处理后再依赖这些快照"
+    elif not rows:
+        result["status"] = "empty"
+        result["message"] = "尚无可检查的备份"
+    return result
+
+
 def delete_backup(db, backup_id, repo_id=None):
     """Remove one verified backup file and row while the backup lock is held.
 

@@ -51,6 +51,7 @@
     <section class="card" aria-labelledby="backups-title">
       <h2 id="backups-title">服务器备份 · 最近 3 份</h2>
       <p class="field-help">首次检查建立基线，每次真正更新前再备份当前版本；相同提交只保留一份。备份失败不更新；安全同步和强制同步均遵循异常删除保护设置。</p>
+      <p><a class="secondary link" href="/repos/{{ repo.id }}/backups/health">检查备份健康</a></p>
       {% if repo.restore_backup_id %}<p class="notice warn" role="status">回滚正在排队或执行，同步已暂停。完成后请刷新查看事件结果。</p>{% endif %}
       {% if backup_error %}<p class="notice warn" role="alert">备份未完成：{{ backup_error.last_error }}。约 10 分钟后重试；期间不更新 fork。</p>{% endif %}
       {% if backups %}
@@ -112,6 +113,18 @@
           <button class="danger">移除管理</button></form>
       </div>
       </details>
+    </section>
+    <section class="card" aria-labelledby="repo-interval-title">
+      <h2 id="repo-interval-title">此仓库检查间隔</h2>
+      <p class="field-help">留空跟随系统默认值；独立维护仓库不会触发上游同步。保存后会唤醒检查 Worker。</p>
+      <form method="post" action="/repos/{{ repo.id }}/interval" class="sync-settings-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label for="repo-interval-minutes">上游检查间隔
+          <div class="input-unit"><input id="repo-interval-minutes" type="number" name="interval_minutes" value="{{ repo_interval_minutes }}" min="0.25" step="any" placeholder="跟随系统" aria-describedby="repo-interval-help"><span>分钟</span></div>
+        </label>
+        <p id="repo-interval-help" class="field-help">最短 0.25 分钟；可以填写 30、60 或 1440（每天）。</p>
+        <button class="secondary">保存此仓库间隔</button>
+      </form>
     </section>
     <section class="card" aria-labelledby="repo-protection-title">
       <h2 id="repo-protection-title">异常删除保护</h2>

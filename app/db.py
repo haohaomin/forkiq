@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS repositories(
   discovered INTEGER NOT NULL DEFAULT 0,
   is_archived INTEGER NOT NULL DEFAULT 0,
   sync_requested INTEGER NOT NULL DEFAULT 0,
+  check_interval INTEGER,
   deletion_protection INTEGER,
   deletion_max_files INTEGER,
   deletion_max_percent REAL,
@@ -145,6 +146,8 @@ class DB:
         for name, kind in (("restore_backup_id", "INTEGER"), ("restore_expected_sha", "TEXT")):
             if name not in columns:
                 conn.execute(f"ALTER TABLE repositories ADD COLUMN {name} {kind}")
+        if "check_interval" not in columns:
+            conn.execute("ALTER TABLE repositories ADD COLUMN check_interval INTEGER")
         # Legacy mirror rows now only fast-forward. Legacy custom forks must
         # never start merging automatically after upgrading this installation.
         conn.execute("UPDATE repositories SET mode='safe' WHERE mode='mirror'")

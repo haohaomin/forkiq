@@ -18,11 +18,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .db import DB, log_event, utcnow
-from .backups import BackupError, backup_path, delete_backup, verified_backup
+from .backups import BackupError, backup_health, backup_path, delete_backup, verified_backup
 from .errors import error_guidance
 from .engine import (MAX_CHECK_INTERVAL_SECONDS, Worker, add_manual, app_client_from_settings,
                      client_from_settings, discover, parse_fork_url)
 from .github import AuthError, exchange_manifest, write_pem
+from .notifications import list_notifications, mark_all_read, seen_id, unread_count
 from .protection import deletion_policy, load_review, parse_limits, review_token
 from .versions import annotate, fork_tone, short_time, version_verdict
 from .repo_actions import bulk_update
@@ -150,6 +151,7 @@ def render(request, name, **context):
     token = request.cookies.get("forkiq_session", "")
     context.update(csrf=csrf_for(token) if token else "",
                    setup_done=db.get_setting("setup_done") == "1",
+                   notification_unread=unread_count(db),
                    asset_version=ASSET_VERSION)
     return templates.TemplateResponse(request, name, context)
 
@@ -176,6 +178,7 @@ def startup():
     # after every restart take about a second; warm the cache up front instead.
     for name in ("base.html", "shell.html", "overview.html", "repos.html",
                  "repo_detail.html", "settings.html", "login.html", "setup.html",
+                 "notifications.html", "backup_health.html",
                  "partials/repo_table.html", "partials/overview_regions.html"):
         templates.get_template(name)
     worker.start()
@@ -249,6 +252,28 @@ def logout(request: Request):
     response = RedirectResponse("/login", status_code=302)
     response.delete_cookie("forkiq_session")
     return response
+
+
+@app.get("/notifications", response_class=HTMLResponse)
+def notifications_page(request: Request):
+    guard = require_login(request)
+    if guard:
+        return guard
+    return render(request, "notifications.html",
+                  notifications=list_notifications(db),
+                  notifications_seen=seen_id(db))
+
+
+@app.post("/notifications/read")
+def notifications_read(request: Request, csrf: str = Form("")):
+    guard = require_login(request)
+    if guard:
+        return guard
+    denied = check_csrf(request, csrf)
+    if denied:
+        return denied
+    mark_all_read(db)
+    return RedirectResponse("/notifications", status_code=303)
 
 
 # -- GitHub App connection -------------------------------------------------
@@ -558,7 +583,41 @@ def repo_detail(request: Request, repo_id: int):
                   deletion_review=review, can_confirm_deletion=can_confirm,
                   deletion_token=review_token(review) if can_confirm else "",
                   backups=backups, backup_error=backup_error, baseline_ready=baseline_ready,
+                  repo_interval_minutes=("" if repo["check_interval"] is None else
+                                         format(Decimal(str(repo["check_interval"])) / 60, "f")),
                   notice=request.query_params.get("notice", ""))
+
+
+@app.post("/repos/{repo_id}/interval")
+def repo_interval(request: Request, repo_id: int, csrf: str = Form(""),
+                  interval_minutes: str = Form("")):
+    guard = require_login(request)
+    if guard:
+        return guard
+    denied = check_csrf(request, csrf)
+    if denied:
+        return denied
+    repo = db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))
+    if not repo:
+        return JSONResponse({"error": "仓库不存在"}, status_code=404)
+    try:
+        if not interval_minutes.strip():
+            value = None
+        else:
+            minutes = float(interval_minutes)
+            if not math.isfinite(minutes) or minutes <= 0:
+                raise ValueError
+            seconds = max(0.25, minutes) * 60
+            if not math.isfinite(seconds) or seconds > MAX_CHECK_INTERVAL_SECONDS:
+                raise ValueError
+            value = round(seconds)
+    except (AttributeError, ValueError):
+        return JSONResponse({"error": "检查间隔必须是有效的正数且不能超出系统支持范围"}, status_code=400)
+    db.run("UPDATE repositories SET check_interval=?, updated_at=? WHERE id=?",
+           (value, utcnow(), repo_id))
+    worker.request_sync()
+    label = "跟随系统默认值" if value is None else f"{value / 60:g} 分钟"
+    return RedirectResponse(f"/repos/{repo_id}?notice=此仓库检查间隔已设为{label}", status_code=303)
 
 
 @app.get("/backups/{backup_id}/download")
@@ -574,6 +633,18 @@ def download_backup(request: Request, backup_id: int):
     return FileResponse(backup_path(db, record), media_type="application/octet-stream",
                         filename=f"{record['full_name'].replace('/', '-')}-{record['fork_sha'][:12]}.bundle",
                         headers={"Cache-Control": "no-store"})
+
+
+@app.get("/repos/{repo_id}/backups/health", response_class=HTMLResponse)
+def backup_health_page(request: Request, repo_id: int):
+    guard = require_login(request)
+    if guard:
+        return guard
+    repo = db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))
+    if not repo:
+        return JSONResponse({"error": "仓库不存在"}, status_code=404)
+    return render(request, "backup_health.html", repo=repo,
+                  health=backup_health(db, repo["full_name"]))
 
 
 @app.post("/repos/{repo_id}/backups/{backup_id}/delete")

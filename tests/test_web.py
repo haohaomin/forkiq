@@ -1351,6 +1351,23 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
+    def test_notifications_show_actionable_events_and_can_be_marked_read(self):
+        token = self.setup_admin()
+        from app.db import log_event
+        from app.notifications import mark_all_read
+        mark_all_read(self.main.db)  # ignore the setup auth event in this test
+        log_event(self.main.db, None, "blocked", "me/demo 异常删除保护已拦截")
+        log_event(self.main.db, None, "check", "me/demo 已修改设置")
+        response, page = self.rendered_page("/notifications")
+        self.assertIn("异常删除保护已拦截", response.text)
+        self.assertNotIn("已修改设置", response.text)
+        self.assertIn("1 条未读通知", self.client.get("/").text)
+        with mock.patch.object(self.main.worker, "request_sync") as wake:
+            response = self.client.post("/notifications/read", data={"csrf": self.csrf(token)})
+        self.assertEqual(response.status_code, 303)
+        wake.assert_not_called()
+        self.assertNotIn("1 条未读通知", self.client.get("/").text)
+
     def test_detect_installation_stores_id(self):
         token = self.setup_admin()
         self.main.db.set_setting("github_app_id", "1")
@@ -1386,6 +1403,39 @@ class WebTests(unittest.TestCase):
                                             "auto_discover": "0"})
         self.assertEqual(self.main.db.get_setting("check_interval"), "599940")
         self.assertEqual(self.main.db.get_setting("auto_discover"), "0")
+
+    def test_repository_interval_can_override_or_inherit_global_setting(self):
+        token = self.setup_admin()
+        from app.db import insert_repository
+        repo_id = insert_repository(self.main.db, owner="me", name="demo",
+                                    full_name="me/demo", upstream_full_name="up/demo")
+        with mock.patch.object(self.main.worker, "request_sync") as wake:
+            response = self.client.post(f"/repos/{repo_id}/interval", data={
+                "csrf": self.csrf(token), "interval_minutes": "60"})
+        self.assertEqual(response.status_code, 303)
+        wake.assert_called_once()
+        self.assertEqual(self.main.db.one("SELECT check_interval FROM repositories WHERE id=?", (repo_id,))[0], 3600)
+        _, page = self.rendered_page(f"/repos/{repo_id}")
+        self.assertEqual(page.find("input", name="interval_minutes")[0]["attrs"]["value"], "60")
+        with mock.patch.object(self.main.worker, "request_sync") as wake:
+            response = self.client.post(f"/repos/{repo_id}/interval", data={
+                "csrf": self.csrf(token), "interval_minutes": ""})
+        self.assertEqual(response.status_code, 303)
+        wake.assert_called_once()
+        self.assertIsNone(self.main.db.one("SELECT check_interval FROM repositories WHERE id=?", (repo_id,))[0])
+
+    def test_repository_interval_rejects_invalid_values_without_writing(self):
+        token = self.setup_admin()
+        from app.db import insert_repository
+        repo_id = insert_repository(self.main.db, owner="me", name="demo",
+                                    full_name="me/demo", upstream_full_name="up/demo")
+        for value in ("0", "-1", "nan", "1e100"):
+            with self.subTest(value=value), mock.patch.object(self.main.worker, "request_sync") as wake:
+                response = self.client.post(f"/repos/{repo_id}/interval", data={
+                    "csrf": self.csrf(token), "interval_minutes": value})
+            self.assertEqual(response.status_code, 400)
+            wake.assert_not_called()
+            self.assertIsNone(self.main.db.one("SELECT check_interval FROM repositories WHERE id=?", (repo_id,))[0])
 
     def test_minutes_round_trip_preserves_stored_seconds_and_wakes_worker(self):
         token = self.setup_admin()
@@ -1700,6 +1750,9 @@ class WebTests(unittest.TestCase):
         stub.nodes["N1"] = node("N1", "me/demo", "up/demo", "b" * 40, "c" * 40)
         stub.file_trees["me/demo", "b" * 40] = {"README.md"}
         stub.file_trees["up/demo", "c" * 40] = set()
+        # The repository interval now gates routine polls after a successful
+        # sync; make this test's second worker tick an explicit due check.
+        self.main.db.run("UPDATE repositories SET last_check_at=NULL WHERE id=?", (repo_id,))
         with mock.patch.object(engine, "client_from_settings", return_value=stub):
             self.main.worker._tick(self.main.db)
         blocked = self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))

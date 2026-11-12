@@ -1,0 +1,25 @@
+{% extends "shell.html" %}
+{% set active_page = "repos" %}
+{% block title %}ForkIQ · 备份健康{% endblock %}
+{% block page_title %}备份健康检查{% endblock %}
+{% block content %}
+<a class="back-link" href="/repos/{{ repo.id }}">返回仓库详情</a>
+<section class="card" aria-labelledby="backup-health-title">
+  <h2 id="backup-health-title">{{ repo.full_name }} · 备份健康</h2>
+  <p class="notice {{ 'warn' if health.status == 'warning' else '' }}" role="status">{{ health.message }}</p>
+  <dl class="kv">
+    <dt>检查结果</dt><dd>{{ health.healthy }} 份完整 / {{ health.total }} 份记录</dd>
+    <dt>占用空间</dt><dd>{{ '%.1f' | format(health.bytes / 1048576) }} MiB</dd>
+    <dt>磁盘剩余</dt><dd>{% if health.free_bytes is not none %}{{ '%.1f' | format(health.free_bytes / 1073741824) }} GiB{% else %}无法读取{% endif %}</dd>
+    <dt>异常统计</dt><dd>缺失 {{ health.missing }} · 损坏 {{ health.corrupt }} · 生成中 {{ health.pending }} · 失败 {{ health.failed }}</dd>
+  </dl>
+  {% if health.items %}
+  <ul class="backup-list">
+    {% for item in health.items %}
+    <li><div class="backup-version"><strong class="mono">{{ item.fork_sha[:12] }}</strong><span class="muted">{{ item.size_bytes }} bytes</span></div><span class="tag {% if item.state != 'healthy' %}tag-warn{% endif %}">{{ item.message }}</span></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <p class="field-help">检查只读取备份记录、文件和磁盘空间，不会修改 GitHub、数据库或备份文件，也不会执行恢复演练。</p>
+</section>
+{% endblock %}

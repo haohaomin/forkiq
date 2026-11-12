@@ -191,6 +191,25 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.status(), "synced")
         self.assertFalse(any(c[0] == "update_ref" for c in self.client.calls))
 
+    def test_repository_interval_skips_until_due_but_manual_sync_wakes_it(self):
+        from datetime import datetime, timedelta, timezone
+        self.client.nodes["N1"] = node("N1", "me/demo", "up/demo", "a" * 40, "a" * 40)
+        old = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        self.db.run("UPDATE repositories SET status='synced', check_interval=3600,last_check_at=? WHERE id=?", (old, self.repo_id))
+        now = datetime.now(timezone.utc).isoformat()
+        self.db.run("INSERT INTO repository_backups(repo_id,full_name,fork_sha,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (self.repo_id, "me/demo", "a" * 40, "ready", now, now))
+        engine.run_cycle(self.db, self.client)
+        self.assertFalse(any(call[0] == "graphql" for call in self.client.calls))
+        self.db.run("UPDATE repositories SET sync_requested=1 WHERE id=?", (self.repo_id,))
+        engine.run_cycle(self.db, self.client)
+        self.assertTrue(any(call[0] == "graphql" for call in self.client.calls))
+        self.client.calls.clear()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=3601)).isoformat()
+        self.db.run("UPDATE repositories SET last_check_at=?, sync_requested=0 WHERE id=?", (due, self.repo_id))
+        engine.run_cycle(self.db, self.client)
+        self.assertTrue(any(call[0] == "graphql" for call in self.client.calls))
+
     def test_cycle_records_tags_and_commit_dates(self):
         # The version columns come from the same batched GraphQL node: the
         # newest tag per side plus each default-branch head's commit date.

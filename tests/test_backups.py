@@ -76,6 +76,23 @@ class BackupTests(unittest.TestCase):
     def records(self, full_name="me/demo"):
         return self.db.all("SELECT * FROM repository_backups WHERE full_name=? ORDER BY id", (full_name,))
 
+    def test_backup_health_reports_complete_missing_corrupt_and_disk_space(self):
+        first = self.backup(self.commits[0])
+        health = backups.backup_health(self.db, "me/demo")
+        self.assertEqual((health["status"], health["healthy"], health["missing"], health["corrupt"]),
+                         ("healthy", 1, 0, 0))
+        path = backups.backup_path(self.db, first)
+        path.write_bytes(b"damaged")
+        health = backups.backup_health(self.db, "me/demo")
+        self.assertEqual((health["status"], health["healthy"], health["corrupt"]), ("warning", 0, 1))
+        path.unlink()
+        health = backups.backup_health(self.db, "me/demo")
+        self.assertEqual((health["status"], health["missing"]), ("warning", 1))
+        with mock.patch("app.backups.shutil.disk_usage", return_value=mock.Mock(free=0)):
+            health = backups.backup_health(self.db, "me/demo")
+        self.assertTrue(health["low_space"])
+        self.assertIn("空间", health["message"])
+
     def more_commits(self, count=2):
         for number in range(count):
             (self.source / "keep.txt").write_text(f"new version {number}\n")

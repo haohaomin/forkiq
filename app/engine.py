@@ -993,9 +993,39 @@ def _retry_due(row):
         return True
 
 
+def _effective_check_interval(db, row):
+    """Return this repository's interval, falling back to the global setting."""
+    try:
+        value = int(row["check_interval"] or db.get_setting("check_interval", "30"))
+    except (TypeError, ValueError):
+        value = 30
+    return max(15, min(MAX_CHECK_INTERVAL_SECONDS, value))
+
+
+def _check_due(db, row):
+    if row["sync_requested"] or not row["last_check_at"]:
+        return True
+    try:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(row["last_check_at"])
+        return age.total_seconds() >= _effective_check_interval(db, row)
+    except (TypeError, ValueError):
+        return True
+
+
+def _routine_check_due(db, row):
+    """Whether a routine poll should run for a healthy, backed-up repo."""
+    if not row["enabled"] or row["status"] not in ("synced", "behind", "missing"):
+        return True
+    has_backup = bool(db.one(
+        "SELECT 1 FROM repository_backups WHERE full_name=? AND status='ready' LIMIT 1",
+        (row["full_name"],)))
+    return not has_backup or _check_due(db, row)
+
+
 def run_cycle(db, client):
     """One full pass over managed repositories. Returns True when a sync happened."""
-    rows = db.all("SELECT * FROM repositories ORDER BY id")
+    rows = [row for row in db.all("SELECT * FROM repositories ORDER BY id")
+            if row["restore_backup_id"] is None and _routine_check_due(db, row)]
     if not rows:
         return False
     did_work = False
@@ -1010,6 +1040,12 @@ def run_cycle(db, client):
         for row in rows[start:start + BATCH]:
             row = db.one("SELECT * FROM repositories WHERE id=?", (row["id"],))
             if not row or row["restore_backup_id"] is not None:
+                continue
+            # Pending and attention states need another pass immediately: a
+            # new protection result, approval, or recovered API response may
+            # change the decision.  Once a repository is healthy and has a
+            # verified baseline, its configured interval gates routine polls.
+            if not _routine_check_due(db, row):
                 continue
             node = nodes.get(row["node_id"]) if row["node_id"] else None
             initial_sha = (((node or {}).get("defaultBranchRef") or {}).get("target") or {}).get("oid")
@@ -1084,8 +1120,12 @@ class Worker(threading.Thread):
         while not self.stop_flag.is_set():
             interval = 30
             try:
-                interval = max(15, min(MAX_CHECK_INTERVAL_SECONDS, int(db.get_setting("check_interval", "30"))))
-            except ValueError:
+                interval = _effective_check_interval(db, {"check_interval": None})
+                custom = db.one("SELECT MIN(check_interval) AS value FROM repositories "
+                                "WHERE enabled=1 AND check_interval IS NOT NULL")
+                if custom and custom["value"] is not None:
+                    interval = min(interval, max(15, min(MAX_CHECK_INTERVAL_SECONDS, int(custom["value"]))))
+            except (TypeError, ValueError):
                 pass
             try:
                 self._tick(db)
