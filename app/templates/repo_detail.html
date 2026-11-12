@@ -91,6 +91,7 @@
       <div class="actions">
         <form method="post" action="/repos/{{ repo.id }}/mode">
           <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="mode_choice" value="{{ 'safe' if repo.mode in ('protected', 'force') else 'protected' }}">
           <button class="secondary">{{ '切换为安全同步' if repo.mode in ('protected', 'force') else '设为独立维护（禁止同步）' }}</button>
         </form>
         {% if repo.mode != 'force' %}<a class="danger link" href="/repos/{{ repo.id }}/force-mode">切换为强制同步</a>{% else %}

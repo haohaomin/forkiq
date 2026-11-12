@@ -1,5 +1,6 @@
 """ForkIQ: GitHub fork sync panel."""
 import hashlib
+from decimal import Decimal
 import hmac
 import ipaddress
 import json
@@ -671,36 +672,53 @@ def _repo_action(request, repo_id, csrf, action, return_filter=None, return_q=""
         return JSONResponse({"error": "回滚正在处理，请等待完成后再操作"}, status_code=409)
     if repo["mode"] == "protected" and action in ("resume", "sync", "selfupdate"):
         return JSONResponse({"error": "独立维护仓库已禁止上游同步。需先切换为安全同步；检测到独有提交仍会停止。"}, status_code=409)
+    conflict = JSONResponse({"error": "仓库状态已变化，请刷新后重新操作"}, status_code=409)
+
+    def change(sql, params=()):
+        # A restore or protection request can commit after the read above.
+        # Compare the state in the write itself; do not hold a DB transaction
+        # across the GitHub calls in the legacy self-update action.
+        return db.run(sql + " WHERE id=? AND restore_backup_id IS NULL AND mode=? "
+                      "AND enabled=? AND status=? AND sync_requested=? AND branch=? "
+                      "AND full_name=? AND upstream_full_name IS ? AND self_update_interval IS ?",
+                      (*params, repo_id, repo["mode"], repo["enabled"], repo["status"],
+                       repo["sync_requested"], repo["branch"], repo["full_name"],
+                       repo["upstream_full_name"], repo["self_update_interval"])).rowcount
+
     if action == "pause":
-        db.run("UPDATE repositories SET status='paused', enabled=0, sync_requested=0, deletion_approval=NULL, updated_at=? WHERE id=?",
-               (utcnow(), repo_id))
+        if not change("UPDATE repositories SET status='paused', enabled=0, sync_requested=0, deletion_approval=NULL, updated_at=?",
+                      (utcnow(),)):
+            return conflict
         log_event(db, repo_id, "blocked", f"{repo['full_name']} 已暂停")
     elif action == "resume":
-        db.run("UPDATE repositories SET status='pending', enabled=1, sync_requested=1, last_error=NULL, deletion_approval=NULL, updated_at=? WHERE id=?",
-               (utcnow(), repo_id))
+        if not change("UPDATE repositories SET status='pending', enabled=1, sync_requested=1, last_error=NULL, deletion_approval=NULL, updated_at=?",
+                      (utcnow(),)):
+            return conflict
         log_event(db, repo_id, "check", f"{repo['full_name']} 已恢复")
         worker.request_sync()
     elif action == "sync":
-        db.run("UPDATE repositories SET sync_requested=1, updated_at=? WHERE id=?", (utcnow(), repo_id))
+        if not change("UPDATE repositories SET sync_requested=1, updated_at=?", (utcnow(),)):
+            return conflict
         worker.request_sync()
     elif action == "mode":
-        if mode_choice and mode_choice not in ("safe", "protected", "force"):
-            return JSONResponse({"error": "无效同步模式"}, status_code=400)
+        if mode_choice not in ("safe", "protected", "force"):
+            return JSONResponse({"error": "请刷新页面并明确选择同步模式"}, status_code=400)
         if mode_choice == "force" and confirmation != "force":
             return JSONResponse({"error": "请先打开强制同步确认页"}, status_code=400)
-        mode = mode_choice or ("safe" if repo["mode"] in ("protected", "force") else "protected")
+        mode = mode_choice
         enabled = int(mode != "protected")
-        db.run("UPDATE repositories SET mode=?, enabled=?, status=?, last_error=NULL, "
-               "diverged_at=NULL, diverged_upstream_sha=NULL, sync_requested=?, self_update_interval=NULL, "
-               "deletion_review=NULL, deletion_approval=NULL, "
-               "updated_at=? WHERE id=?", (mode, enabled, "pending" if enabled else "paused", enabled, utcnow(), repo_id))
+        if not change("UPDATE repositories SET mode=?, enabled=?, status=?, last_error=NULL, "
+                      "diverged_at=NULL, diverged_upstream_sha=NULL, sync_requested=?, self_update_interval=NULL, "
+                      "deletion_review=NULL, deletion_approval=NULL, updated_at=?",
+                      (mode, enabled, "pending" if enabled else "paused", enabled, utcnow())):
+            return conflict
         label = {"force": "强制同步（备份后始终对齐上游，覆盖独有提交）", "protected": "独立维护（禁止同步上游）", "safe": "安全同步（仅快进，有独有提交立即停止）"}[mode]
         log_event(db, repo_id, "check", f"{repo['full_name']} 同步方式切换为{label}")
         worker.request_sync()
     elif action == "selfupdate":
         if repo["self_update_interval"]:
-            db.run("UPDATE repositories SET self_update_interval=NULL, self_update=NULL, "
-                   "updated_at=? WHERE id=?", (utcnow(), repo_id))
+            if not change("UPDATE repositories SET self_update_interval=NULL, self_update=NULL, updated_at=?", (utcnow(),)):
+                return conflict
             log_event(db, repo_id, "check", f"{repo['full_name']} 已关闭自更新保活")
         else:
             client = client_from_settings(db)
@@ -724,20 +742,23 @@ def _repo_action(request, repo_id, csrf, action, return_filter=None, return_q=""
                 if enabled:
                     notes.append("已启用 " + "、".join(enabled))
             except Exception as error:
-                db.run("UPDATE repositories SET self_update=?, updated_at=? WHERE id=?",
-                       (f"开启自更新部分失败：{str(error)[:200]}", utcnow(), repo_id))
+                if not change("UPDATE repositories SET self_update=?, updated_at=?",
+                              (f"开启自更新部分失败：{str(error)[:200]}", utcnow())):
+                    return conflict
                 return render(request, "message.html", title="开启失败",
                               body=f"GitHub 拒绝：{error}。"
                                    "在 https://github.com/settings/apps/forkiq/permissions "
                                    "给 Actions 加读写权限并批准后可重试。")
-            db.run("UPDATE repositories SET self_update_interval=1, self_update=NULL, "
-                   "sync_requested=1, updated_at=? WHERE id=?", (utcnow(), repo_id))
+            if not change("UPDATE repositories SET self_update_interval=1, self_update=NULL, "
+                          "sync_requested=1, updated_at=?", (utcnow(),)):
+                return conflict
             log_event(db, repo_id, "check",
                       f"{repo['full_name']} 已开启自更新保活" +
                       (f"（{'; '.join(notes)}）" if notes else ""))
             worker.request_sync()
     elif action == "remove":
-        db.run("DELETE FROM repositories WHERE id=?", (repo_id,))
+        if not change("DELETE FROM repositories"):
+            return conflict
         log_event(db, None, "check", f"{repo['full_name']} 已移出管理（GitHub 仓库未改动）")
     if action in ("pause", "resume") and return_filter in ("all", *STATUS_GROUPS, "diverged", "blocked"):
         label = "已暂停同步" if action == "pause" else "已恢复同步，等待检查"
@@ -890,7 +911,7 @@ def settings_page(request: Request):
     if guard:
         return guard
     return render(request, "settings.html",
-                  interval_minutes=f'{int(db.get_setting("check_interval", "30")) / 60:g}',
+                  interval_minutes=format(Decimal(db.get_setting("check_interval", "30")) / 60, "f"),
                   auto_discover=db.get_setting("auto_discover", "1") == "1",
                   app_slug=db.get_setting("github_app_slug"),
                   installation_id=db.get_setting("github_installation_id"),

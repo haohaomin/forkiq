@@ -3,11 +3,12 @@ import tempfile
 from pathlib import Path
 
 from .backups import (_NAME, _SHA, _run_git, _fetch_repository,
-                      _authenticated_git_env, ensure_backup, verified_backup)
+                      _authenticated_git_env, ensure_backup, verified_backup, _locked, _root)
 from .db import utcnow, log_event
+from .protection import deletion_policy
 
 
-def align_upstream(db, client, row, fork_sha, target_sha):
+def align_upstream(db, client, row, fork_sha, target_sha, *, deletion_guard):
     stage = 'prepare'
     try:
         if not all(isinstance(s, str) and _SHA.fullmatch(s) for s in (fork_sha, target_sha)):
@@ -31,16 +32,35 @@ def align_upstream(db, client, row, fork_sha, target_sha):
                     or live['restore_backup_id'] is not None
                     or any(live[k] != row[k] for k in ('branch', 'full_name', 'upstream_full_name'))):
                 return 'paused'
-            if (client.get_ref(row['full_name'], row['branch']) != fork_sha
-                    or client.get_ref(row['upstream_full_name'], row['branch']) != target_sha):
-                raise ValueError('HEAD changed')
-            stage = 'push'
-            _run_git(['push', '--porcelain', '--no-verify', '--no-follow-tags', '--recurse-submodules=no',
-                      f'--force-with-lease={ref}:{fork_sha}', '--',
-                      'https://github.com/' + row['full_name'] + '.git', target_sha + ':' + ref],
-                     work, env=_authenticated_git_env(client))
-            if client.get_ref(row['full_name'], row['branch']) != target_sha:
-                raise ValueError('unconfirmed push')
+            # Fetches can take minutes. Review only after preparation, so a
+            # protection change during that work cannot reuse an old decision.
+            policy = deletion_policy(db, live)
+            if not deletion_guard(db, client, row, fork_sha, target_sha):
+                return 'needs_attention'
+            env = _authenticated_git_env(client)
+            # Do not nest ensure_backup/deletion_guard inside this flock: each
+            # obtains its own lock. Hold it only across final verification and
+            # the write, preventing manual deletion of the in-use baseline.
+            with _locked(_root(db)):
+                if not verified_backup(db, backup):
+                    raise ValueError('backup unavailable')
+                if (client.get_ref(row['full_name'], row['branch']) != fork_sha
+                        or client.get_ref(row['upstream_full_name'], row['branch']) != target_sha):
+                    raise ValueError('HEAD changed')
+                live = db.one('SELECT * FROM repositories WHERE id=?', (row['id'],))
+                if (not live or live['mode'] != 'force' or not live['enabled'] or live['status'] == 'paused'
+                        or live['restore_backup_id'] is not None
+                        or any(live[k] != row[k] for k in ('branch', 'full_name', 'upstream_full_name'))):
+                    return 'paused'
+                if deletion_policy(db, live) != policy:
+                    raise ValueError('deletion policy changed')
+                stage = 'push'
+                _run_git(['push', '--porcelain', '--no-verify', '--no-follow-tags', '--recurse-submodules=no',
+                          f'--force-with-lease={ref}:{fork_sha}', '--',
+                          'https://github.com/' + row['full_name'] + '.git', target_sha + ':' + ref],
+                         work, env=env)
+                if client.get_ref(row['full_name'], row['branch']) != target_sha:
+                    raise ValueError('unconfirmed push')
         now = utcnow()
         db.run("UPDATE repositories SET status='synced',fork_sha=?,upstream_sha=?,fork_tag=NULL,"
                "fork_commit_at=NULL,fork_ahead=0,upstream_ahead=0,last_error=NULL,last_check_at=?,"

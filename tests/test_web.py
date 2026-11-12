@@ -1202,13 +1202,13 @@ class WebTests(unittest.TestCase):
         self.client.post(f"/repos/{repo_id}/remove", data={"csrf": self.csrf(token)})
         self.assertIsNone(self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,)))
 
-    def test_mode_toggle_protects_and_safe_mode_always_rechecks(self):
+    def test_explicit_mode_choice_protects_and_safe_mode_always_rechecks(self):
         token = self.setup_admin()
         from app.db import insert_repository
         repo_id = insert_repository(self.main.db, owner="me", name="demo",
                                     full_name="me/demo", upstream_full_name="up/demo")
         endpoint = f"/repos/{repo_id}"
-        response = self.client.post(endpoint + "/mode", data={"csrf": self.csrf(token)})
+        response = self.client.post(endpoint + "/mode", data={"csrf": self.csrf(token), "mode_choice": "protected"})
         self.assertEqual(response.status_code, 302)
         row = self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))
         self.assertEqual(row["mode"], "protected")
@@ -1221,12 +1221,64 @@ class WebTests(unittest.TestCase):
         _, page = self.rendered_page(endpoint)
         self.assertFalse(page.find("form", action=endpoint + "/resume"))
         self.assertFalse(page.find("form", action=endpoint + "/sync"))
-        self.client.post(endpoint + "/mode", data={"csrf": self.csrf(token)})
+        self.client.post(endpoint + "/mode", data={"csrf": self.csrf(token), "mode_choice": "safe"})
         row = self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))
         self.assertEqual(row["mode"], "safe")
         self.assertEqual(row["enabled"], 1)
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["sync_requested"], 1)
+
+    def test_stale_protect_form_and_duplicate_submission_never_enable_sync(self):
+        token = self.setup_admin()
+        repo_id, _ = self.repository_with_backup()
+        endpoint = f"/repos/{repo_id}/mode"
+        _, page = self.rendered_page(f"/repos/{repo_id}")
+        form = self.assert_post_form(page, endpoint, token)
+        self.assertIn("设为独立维护", form["text"])
+        payload = {field["attrs"]["name"]: field["attrs"].get("value", "")
+                   for field in page.inside(form, "input")}
+        self.assertEqual(payload["mode_choice"], "protected")
+        # A worker or another tab protected the repository after this form was rendered.
+        self.main.db.run("UPDATE repositories SET mode='protected',enabled=0,status='paused' WHERE id=?", (repo_id,))
+        for _ in range(2):
+            self.assertEqual(self.client.post(endpoint, data=payload).status_code, 302)
+            row = self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))
+            self.assertEqual((row["mode"], row["enabled"], row["status"], row["sync_requested"]),
+                             ("protected", 0, "paused", 0))
+        with mock.patch.object(self.main.worker, "request_sync") as wake:
+            # Already-open forms from before this fix contain no explicit intent.
+            response = self.client.post(endpoint, data={"csrf": self.csrf(token)})
+            self.assertEqual(response.status_code, 400)
+            wake.assert_not_called()
+        self.assertEqual(self.main.db.one("SELECT mode FROM repositories WHERE id=?", (repo_id,))[0], "protected")
+
+    def test_single_repository_actions_reject_concurrent_restore_or_protection(self):
+        token = self.setup_admin()
+        repo_id, record = self.repository_with_backup()
+        original_run = self.main.db.run
+        for concurrent in ("restore", "protect"):
+            for action in ("pause", "resume", "sync", "mode", "remove"):
+                with self.subTest(concurrent=concurrent, action=action):
+                    original_run("UPDATE repositories SET mode='safe',enabled=1,status='pending',"
+                                 "sync_requested=0,restore_backup_id=NULL,restore_expected_sha=NULL WHERE id=?", (repo_id,))
+                    raced = []
+                    def race_before_write(sql, params=()):
+                        if not raced and (sql.startswith("UPDATE repositories") or sql.startswith("DELETE FROM repositories")):
+                            if concurrent == "restore":
+                                original_run("UPDATE repositories SET enabled=0,status='paused',restore_backup_id=?,"
+                                             "restore_expected_sha=? WHERE id=?", (record["id"], "c" * 40, repo_id))
+                            else:
+                                original_run("UPDATE repositories SET mode='protected',enabled=0,status='paused' WHERE id=?", (repo_id,))
+                            raced.append(dict(self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))))
+                        return original_run(sql, params)
+                    with mock.patch.object(self.main.db, "run", side_effect=race_before_write), \
+                         mock.patch.object(self.main.worker, "request_sync") as wake:
+                        response = self.client.post(f"/repos/{repo_id}/{action}", data={
+                            "csrf": self.csrf(token), "mode_choice": "force", "confirmation": "force"})
+                        self.assertEqual(response.status_code, 409)
+                        wake.assert_not_called()
+                    self.assertEqual(len(raced), 1)
+                    self.assertEqual(dict(self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))), raced[0])
 
     def test_selfupdate_toggle_enables_actions_and_permissions(self):
         token = self.setup_admin()
@@ -1348,6 +1400,20 @@ class WebTests(unittest.TestCase):
                 _, page = self.rendered_page("/settings")
                 self.assertEqual(page.find("input", name="interval_minutes")[0]["attrs"]["value"], minutes)
 
+    def test_interval_form_roundtrip_preserves_seconds_at_all_supported_scales(self):
+        token = self.setup_admin()
+        for seconds in (91, 604807, 60000060, self.main.MAX_CHECK_INTERVAL_SECONDS):
+            with self.subTest(seconds=seconds):
+                self.main.db.set_setting("check_interval", str(seconds))
+                _, page = self.rendered_page("/settings")
+                displayed = page.find("input", name="interval_minutes")[0]["attrs"]["value"]
+                with mock.patch.object(self.main.worker, "request_sync") as wake:
+                    response = self.client.post("/settings", data={
+                        "csrf": self.csrf(token), "interval_minutes": displayed})
+                self.assertEqual(response.status_code, 302)
+                wake.assert_called_once()
+                self.assertEqual(self.main.db.get_setting("check_interval"), str(seconds))
+
     def test_predeploy_seconds_form_still_saves_during_rolling_deploy(self):
         token = self.setup_admin()
         with mock.patch.object(self.main.worker, "request_sync") as wake:
@@ -1418,9 +1484,15 @@ class WebTests(unittest.TestCase):
                 observation = stub.nodes["N1"]
                 def row():
                     return self.main.db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))
-                with mock.patch.object(engine, "align_upstream", return_value="synced") as align:
+                pushes = mock.Mock()
+                def reviewed_alignment(db, client, repo, fork_sha, target_sha, *, deletion_guard):
+                    if not deletion_guard(db, client, repo, fork_sha, target_sha):
+                        return "needs_attention"
+                    pushes()
+                    return "synced"
+                with mock.patch.object(engine, "align_upstream", side_effect=reviewed_alignment):
                     self.assertEqual(engine.sync_one(self.main.db, stub, row(), observation), "needs_attention")
-                    align.assert_not_called()
+                    pushes.assert_not_called()
                     self.assertEqual(stub.refs["me/demo"], "a" * 40)
                     self.assertEqual(row()["mode"], "force")
                     approval = review_token(load_review(row()))
@@ -1431,11 +1503,11 @@ class WebTests(unittest.TestCase):
                         continue
                     self.assertEqual(response.status_code, 302)
                     self.assertEqual(engine.sync_one(self.main.db, stub, row(), observation), "synced")
-                    align.assert_called_once()
+                    pushes.assert_called_once()
                     self.assertIsNone(row()["deletion_approval"])
                     # A failed/unconfirmed push cannot reuse the consumed approval.
                     self.assertEqual(engine.sync_one(self.main.db, stub, row(), observation), "needs_attention")
-                    align.assert_called_once()
+                    pushes.assert_called_once()
 
     def backup_record(self, repo_id, full_name="me/demo", fork_sha=None, status="ready",
                       contents=b"isolated backup fixture\n", error=None):

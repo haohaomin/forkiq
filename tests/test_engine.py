@@ -519,7 +519,7 @@ class EngineTests(unittest.TestCase):
         engine.run_cycle(self.db, self.client)
         self.assertEqual(self.row()["branch"], "trunk")
         # resume (as the panel does) -> next cycle syncs on the new branch
-        self.db.run("UPDATE repositories SET status='pending' WHERE id=?", (self.repo_id,))
+        self.db.run("UPDATE repositories SET enabled=1,status='pending',sync_requested=1 WHERE id=?", (self.repo_id,))
         self.client.refs["me/demo"] = "a" * 40
         engine.run_cycle(self.db, self.client)
         self.assertEqual(self.status(), "synced")
@@ -531,6 +531,48 @@ class EngineTests(unittest.TestCase):
         engine.run_cycle(self.db, self.client)
         self.assertEqual(self.status(), "needs_attention")
         self.assertEqual(self.row()["branch"], "main")
+
+    def test_changed_sync_identity_stays_disabled_until_explicit_resume(self):
+        for mode in ("safe", "force"):
+            for changed in ("upstream", "branch", "mismatched_branch"):
+                with self.subTest(mode=mode, changed=changed):
+                    self.db.run("DELETE FROM events")
+                    self.db.run("UPDATE repositories SET mode=?,enabled=1,status='pending',"
+                                "branch='main',upstream_full_name='up/demo',sync_requested=1,"
+                                "deletion_review='old review',deletion_approval='old approval' WHERE id=?",
+                                (mode, self.repo_id))
+                    upstream = "other/demo" if changed == "upstream" else "up/demo"
+                    branch = "trunk" if changed != "upstream" else "main"
+                    self.client.nodes["N1"] = node("N1", "me/demo", upstream, "a" * 40, "b" * 40,
+                                                   fork_branch=branch,
+                                                   parent_branch="other" if changed == "mismatched_branch" else branch)
+                    self.client.refs["me/demo"] = "a" * 40
+                    self.client.calls.clear()
+                    with mock.patch.object(engine, "align_upstream", return_value="synced") as align:
+                        engine.run_cycle(self.db, self.client)
+                        self.assertEqual(self.status(), "needs_attention")
+                        self.assertEqual(self.row()["enabled"], 0)
+                        self.assertEqual(self.row()["sync_requested"], 0)
+                        self.assertIsNone(self.row()["deletion_review"])
+                        self.assertIsNone(self.row()["deletion_approval"])
+                        # Even if a mismatched rename is corrected, observing the
+                        # new identity must not silently authorize another target.
+                        if changed == "mismatched_branch":
+                            self.client.nodes["N1"] = node("N1", "me/demo", upstream, "a" * 40, "b" * 40)
+                        engine.run_cycle(self.db, self.client)
+                        engine.run_cycle(self.db, self.client)
+                        align.assert_not_called()
+                        self.assertEqual(self.client.refs["me/demo"], "a" * 40)
+                        self.assertFalse(any(c[0] == "update_ref" for c in self.client.calls))
+                        # Match the panel's explicit resume action.
+                        self.db.run("UPDATE repositories SET enabled=1,status='pending',sync_requested=1 WHERE id=?",
+                                    (self.repo_id,))
+                        engine.run_cycle(self.db, self.client)
+                        if mode == "force":
+                            align.assert_called_once()
+                        else:
+                            self.assertEqual(self.status(), "synced")
+                            self.assertEqual(self.client.refs["me/demo"], "b" * 40)
 
     def test_parent_removed_blocks(self):
         self.client.nodes["N1"] = node("N1", "me/demo", None, "a" * 40, None)

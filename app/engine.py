@@ -856,7 +856,8 @@ def sync_one(db, client, row, node, forced=False):
             log_event(db, repo_id, "blocked",
                       f"{row['full_name']} 的上游变为 {parent['nameWithOwner']}，已暂停等待确认")
         _set_repo(db, repo_id, upstream_full_name=parent["nameWithOwner"],
-                  status="needs_attention", last_check_at=utcnow(),
+                  status="needs_attention", enabled=0, sync_requested=0,
+                  deletion_review=None, deletion_approval=None, last_check_at=utcnow(),
                   last_error=f"上游变更为 {parent['nameWithOwner']}，请确认后恢复", **version)
         return "needs_attention"
     fork_branch, parent_branch = fork_ref["name"], parent_ref["name"]
@@ -900,7 +901,10 @@ def sync_one(db, client, row, node, forced=False):
             _self_update(db, client, row, utcnow(), forced)
         return status
     if fork_branch != row["branch"] or parent_branch != row["branch"]:
-        fields = {"status": "needs_attention", "last_check_at": utcnow()}
+        # Recording a new identity is not permission to sync it on the next
+        # poll. Keep it disabled until the user explicitly resumes.
+        fields = {"status": "needs_attention", "enabled": 0, "sync_requested": 0,
+                  "deletion_review": None, "deletion_approval": None, "last_check_at": utcnow()}
         if fork_branch == parent_branch:
             # Both sides renamed the default branch to the same name; record it
             # so that "resume" continues syncing on the new branch.
@@ -926,13 +930,8 @@ def sync_one(db, client, row, node, forced=False):
                   deletion_review=None, deletion_approval=None, **version)
         return "synced"
     if row["mode"] == "force":
-        # Force mode may overwrite fork-only commits and history, but it still
-        # must pass the same deletion review as safe mode.  The review is
-        # bound to both observed SHAs and can be released once for a specific
-        # target from the repository detail page.
-        if not _deletion_guard(db, client, row, fork_sha, upstream_sha):
-            return "needs_attention"
-        return align_upstream(db, client, row, fork_sha, upstream_sha)
+        return align_upstream(db, client, row, fork_sha, upstream_sha,
+                              deletion_guard=_deletion_guard)
     if not _fast_forward_guard(db, client, row, fork_sha, upstream_sha):
         return "paused"
     if not _deletion_guard(db, client, row, fork_sha, upstream_sha):
