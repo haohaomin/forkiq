@@ -8,6 +8,7 @@
     <nav aria-label="面板导航">
       <a href="/" {% if active_page == 'overview' %}class="active" aria-current="page"{% endif %}>{{ icon('layout-dashboard') }}<span>概览</span></a>
       <a href="/repos" {% if active_page == 'repos' %}class="active" aria-current="page"{% endif %}>{{ icon('folder-git-2') }}<span>仓库管理</span></a>
+      <a href="/notifications" {% if active_page == 'notifications' %}class="active" aria-current="page"{% endif %}>{{ icon('shield-check') }}<span>异常通知</span>{% if notification_unread %}<span class="notification-count" aria-label="{{ notification_unread }} 条未读通知">{{ notification_unread if notification_unread < 100 else '99+' }}</span>{% endif %}</a>
       <a href="/settings" {% if active_page == 'settings' %}class="active" aria-current="page"{% endif %}>{{ icon('settings-2') }}<span>系统设置</span></a>
     </nav>
     <div class="sidebar-note">跟进上游，保留历史。<br>同步过程始终可追溯。</div>

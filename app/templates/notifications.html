@@ -1,0 +1,24 @@
+{% extends "shell.html" %}
+{% from "components.html" import event_kind, timestamp, error_message %}
+{% set active_page = "notifications" %}
+{% set page_icon = "shield-check" %}
+{% block title %}ForkIQ · 异常通知{% endblock %}
+{% block page_title %}异常通知{% endblock %}
+{% block header_actions %}
+  {% if notifications %}<form method="post" action="/notifications/read"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="secondary">全部标为已读</button></form>{% endif %}
+{% endblock %}
+{% block content %}
+  <div class="page-intro"><h2>需要处理的同步事件</h2><p class="muted">只显示同步阻塞、错误和认证异常；手动暂停等普通操作不会重复提醒。</p></div>
+  {% if notifications %}
+  <section class="card notification-list" aria-label="异常通知">
+    {% for item in notifications %}
+    <article class="notification-item{% if item.id > notifications_seen %} unread{% endif %}">
+      <div class="notification-meta"><span>{{ event_kind(item.kind) }}</span>{{ timestamp(item.at) }}{% if item.full_name %}<a href="/repos/{{ item.repo_id }}">{{ item.full_name }}</a>{% else %}<span>系统</span>{% endif %}</div>
+      <div class="notification-message">{{ error_message(item.message) if item.kind in ('error', 'blocked', 'auth') else item.message }}</div>
+    </article>
+    {% endfor %}
+  </section>
+  {% else %}
+  <section class="card empty-state"><h2>目前没有待处理通知</h2><p class="muted">同步被阻塞、备份失败或 GitHub 认证异常时会显示在这里。</p></section>
+  {% endif %}
+{% endblock %}
