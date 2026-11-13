@@ -40,6 +40,44 @@ class UpdateRefTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertEqual(request.call_args.args[3], {"sha": "a" * 40, "force": True})
 
+
+class GraphQLRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.client = GitHub()
+        self.query = "query { viewer { login } }"
+        self.variables = {}
+
+    def test_transient_gateway_errors_are_retried_before_returning_data(self):
+        payload = {"data": {"viewer": {"login": "me"}}}
+        with mock.patch.object(self.client, "installation_token", return_value="tok"), \
+             mock.patch.object(self.client, "_request", side_effect=[
+                 (502, {"message": "bad gateway"}, {}),
+                 (503, {"message": "unavailable"}, {}),
+                 (200, payload, {})]) as request, \
+             mock.patch("app.github.time.sleep") as sleep:
+            self.assertEqual(self.client.graphql(self.query, self.variables), payload["data"])
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.5), mock.call(1.0)])
+
+    def test_exhausted_gateway_retries_include_attempt_timing_and_request_id(self):
+        response = (502, {"message": "bad gateway"}, {"X-GitHub-Request-Id": "ABC123"})
+        with mock.patch.object(self.client, "installation_token", return_value="tok"), \
+             mock.patch.object(self.client, "_request", return_value=response) as request, \
+             mock.patch("app.github.time.sleep") as sleep, \
+             self.assertRaisesRegex(RuntimeError, r"GraphQL -> 502.*attempts=3.*elapsed=.*request_id=ABC123"):
+            self.client.graphql(self.query, self.variables)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.5), mock.call(1.0)])
+
+    def test_non_gateway_errors_are_not_retried(self):
+        with mock.patch.object(self.client, "installation_token", return_value="tok"), \
+             mock.patch.object(self.client, "_request", return_value=(500, {"message": "server error"}, {})) as request, \
+             mock.patch("app.github.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, r"GraphQL -> 500"):
+                self.client.graphql(self.query, self.variables)
+        request.assert_called_once()
+        sleep.assert_not_called()
+
     def test_other_validation_error_preserves_structured_diagnostic_details(self):
         client = GitHub()
         payload = {"message": "Validation failed", "errors": [{"resource": "Reference", "code": "invalid"}]}

@@ -14,6 +14,12 @@ import jwt
 API = "https://api.github.com"
 GRAPHQL = "https://api.github.com/graphql"
 GIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
+GRAPHQL_RETRY_STATUSES = frozenset((502, 503, 504))
+# GraphQL node batches are read-only, so transient gateway responses can be
+# retried safely. Keep the total wait short enough that a worker cycle does
+# not get stuck behind one unhealthy upstream edge.
+GRAPHQL_MAX_ATTEMPTS = 3
+GRAPHQL_RETRY_BACKOFF_SECONDS = 0.5
 
 
 class RateLimited(RuntimeError):
@@ -358,18 +364,37 @@ class GitHub:
 
     # -- GraphQL -----------------------------------------------------------
     def graphql(self, query, variables):
-        status, payload, _ = self._request(
-            "POST", GRAPHQL,
-            {"Authorization": f"token {self.installation_token()}",
-             "Accept": "application/vnd.github+json"}, {"query": query, "variables": variables})
-        if status != 200:
-            raise RuntimeError(f"GraphQL -> {status}: {str(payload)[:300]}")
-        data = payload.get("data")
-        if data is None:
-            raise RuntimeError(f"GraphQL errors: {str(payload.get('errors'))[:300]}")
-        # Partial errors (e.g. one node id unresolvable) still return usable
-        # data with nulls at the failed positions; callers skip null nodes.
-        return data
+        started = time.monotonic()
+        headers = {
+            "Authorization": f"token {self.installation_token()}",
+            "Accept": "application/vnd.github+json",
+        }
+        for attempt in range(1, GRAPHQL_MAX_ATTEMPTS + 1):
+            status, payload, response_headers = self._request(
+                "POST", GRAPHQL, headers,
+                {"query": query, "variables": variables})
+            if status in GRAPHQL_RETRY_STATUSES and attempt < GRAPHQL_MAX_ATTEMPTS:
+                time.sleep(GRAPHQL_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                continue
+            if status != 200:
+                detail = f"GraphQL -> {status}: {str(payload)[:300]}"
+                context = [f"attempts={attempt}",
+                           f"elapsed={time.monotonic() - started:.2f}s"]
+                request_id = next(
+                    (str(value) for key, value in (response_headers or {}).items()
+                     if str(key).lower() == "x-github-request-id" and value),
+                    None)
+                if request_id:
+                    context.append(f"request_id={request_id[:100]}")
+                raise RuntimeError(f"{detail} ({', '.join(context)})")
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"GraphQL 响应无效 (attempts={attempt})")
+            data = payload.get("data")
+            if data is None:
+                raise RuntimeError(f"GraphQL errors: {str(payload.get('errors'))[:300]}")
+            # Partial errors (e.g. one node id unresolvable) still return usable
+            # data with nulls at the failed positions; callers skip null nodes.
+            return data
 
     # -- manifest ----------------------------------------------------------
     def exchange_manifest(self, code):

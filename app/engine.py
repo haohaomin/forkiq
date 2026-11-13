@@ -15,7 +15,10 @@ from .github import (AuthError, DispatchRejected, Forbidden, GitHub, MergeConfli
 from .protection import (assess_change, change_identity, deletion_policy, load_review,
                          review_json, review_token, valid_comparison)
 
-BATCH = 50
+# Keep GraphQL node queries below the gateway's slow edge for large
+# installations. The query is retried at the transport layer, but smaller
+# chunks reduce the chance of a transient 502 and make failures cheaper.
+BATCH = 25
 ERROR_RETRY_SECONDS = 600
 # Prevent platform wait overflow without imposing a product-level five-minute cap.
 MAX_CHECK_INTERVAL_SECONDS = int(threading.TIMEOUT_MAX) - 1
