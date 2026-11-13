@@ -87,8 +87,10 @@ section.card { margin-bottom: 20px; }
 .notification-list { padding: 0 24px; }
 .notification-item { padding: 18px 0; border-bottom: 1px solid var(--line); }
 .notification-item:last-child { border-bottom: 0; }
-.notification-item.unread { border-left: 3px solid var(--red); padding-left: 14px; }
 .notification-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 12px; }
+.notification-meta > a { min-width: 0; overflow-wrap: anywhere; }
+.notification-unread { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; flex-shrink: 0; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.notification-unread::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--primary); }
 .notification-message { margin-top: 7px; overflow-wrap: anywhere; }
 .sidebar nav .icon { width: 18px; height: 18px; }
 .sidebar-note { margin-top: auto; padding: 24px; color: var(--muted); font-size: 12px; line-height: 1.9; }

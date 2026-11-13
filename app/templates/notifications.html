@@ -13,7 +13,7 @@
   <section class="card notification-list" aria-label="异常通知">
     {% for item in notifications %}
     <article class="notification-item{% if item.id > notifications_seen %} unread{% endif %}">
-      <div class="notification-meta"><span>{{ event_kind(item.kind) }}</span>{{ timestamp(item.at) }}{% if item.full_name %}<a href="/repos/{{ item.repo_id }}">{{ item.full_name }}</a>{% else %}<span>系统</span>{% endif %}</div>
+      <div class="notification-meta"><span>{{ event_kind(item.kind) }}</span>{{ timestamp(item.at) }}{% if item.full_name %}<a href="/repos/{{ item.repo_id }}">{{ item.full_name }}</a>{% else %}<span>系统</span>{% endif %}{% if item.id > notifications_seen %}<span class="notification-unread">未读</span>{% endif %}</div>
       <div class="notification-message">{{ error_message(item.message) if item.kind in ('error', 'blocked', 'auth') else item.message }}</div>
     </article>
     {% endfor %}
