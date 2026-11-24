@@ -34,6 +34,20 @@ class NotificationTests(unittest.TestCase):
         self.assertTrue(is_actionable({"kind": "blocked", "message": "demo 强制同步结果未确认"}))
         self.assertTrue(is_actionable({"kind": "auth", "message": "认证失败"}))
 
+    def test_guard_pauses_stay_visible_while_manual_pauses_are_quiet(self):
+        for message in ("me/demo 已暂停", "me/demo 已恢复",
+                        "me/demo 同步方式切换为独立维护（禁止同步上游）",
+                        "me/demo 已请求回滚到 abc，同步已暂停",
+                        "me/demo 批量操作：暂停同步", "me/demo 已移出管理（GitHub 仓库未改动）"):
+            log_event(self.db, None, "blocked", message)
+        guards = ["me/demo 的上游变为 new/demo，已暂停等待确认",
+                  "me/demo 默认分支变更，已暂停等待确认",
+                  "me/demo 强制同步结果未确认，已暂停；请核对 GitHub 分支"]
+        for message in guards:
+            log_event(self.db, None, "blocked", message)
+        self.assertEqual(unread_count(self.db), len(guards))
+        self.assertEqual([row["message"] for row in list_notifications(self.db)], guards[::-1])
+
 
 if __name__ == "__main__":
     unittest.main()

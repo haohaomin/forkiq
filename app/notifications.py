@@ -1,9 +1,7 @@
 """Low-noise, in-panel notifications derived from actionable events."""
 
 ACTIONABLE_KINDS = frozenset(("blocked", "error", "auth"))
-USER_ACTION_MARKERS = (
-    "已暂停", "已恢复", "已请求回滚", "同步方式切换为", "批量操作", "已移出管理",
-)
+USER_ACTION_PREFIXES = ("已请求回滚", "同步方式切换为", "批量操作：", "已移出管理")
 
 
 def is_actionable(event):
@@ -19,7 +17,11 @@ def is_actionable(event):
     if kind != "blocked":
         return False
     message = event["message"] or ""
-    return not any(marker in message for marker in USER_ACTION_MARKERS)
+    # Legacy manual blocked events have the shape "owner/repo 已暂停".
+    # Substring matching also hid real guards such as "的上游变为…，已暂停等待确认".
+    _, separator, action = message.partition(" ")
+    return not (separator and (action in ("已暂停", "已恢复")
+                               or action.startswith(USER_ACTION_PREFIXES)))
 
 
 def _events(db, limit=100):
