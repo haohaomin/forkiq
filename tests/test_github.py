@@ -42,6 +42,10 @@ class UpdateRefTests(unittest.TestCase):
 
 
 class GraphQLRetryTests(unittest.TestCase):
+    internal_message = (
+        "Something went wrong while executing your query on 2026-11-23T21:40:55Z. "
+        "Please include `TEST:REQUEST:123` when reporting this issue.")
+
     def setUp(self):
         self.client = GitHub()
         self.query = "query { viewer { login } }"
@@ -77,6 +81,87 @@ class GraphQLRetryTests(unittest.TestCase):
                 self.client.graphql(self.query, self.variables)
         request.assert_called_once()
         sleep.assert_not_called()
+
+    def test_http_200_internal_failure_retries_the_same_query(self):
+        success = {"data": {"viewer": {"login": "me"}}}
+        for error in ({"message": self.internal_message},
+                      {"type": "INTERNAL", "message": "Internal server error"}):
+            with self.subTest(error=error), \
+                 mock.patch.object(self.client, "installation_token", return_value="tok"), \
+                 mock.patch.object(self.client, "_request", side_effect=[
+                     (200, {"data": None, "errors": [error]}, {}),
+                     (200, success, {})]) as request, \
+                 mock.patch("app.github.time.sleep") as sleep:
+                self.assertEqual(self.client.graphql(self.query, self.variables), success["data"])
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(request.call_args_list[0], request.call_args_list[1])
+            sleep.assert_called_once_with(0.5)
+
+    def test_gateway_and_internal_failures_share_one_retry_budget_and_diagnostics(self):
+        internal = {"errors": [{"message": self.internal_message}]}
+        with mock.patch.object(self.client, "installation_token", return_value="tok"), \
+             mock.patch.object(self.client, "_request", side_effect=[
+                 (502, {"message": "Bad Gateway"}, {}),
+                 (200, internal, {}),
+                 (200, internal, {"x-github-request-id": "FINAL:123"})]) as request, \
+             mock.patch("app.github.time.sleep") as sleep, \
+             self.assertRaisesRegex(RuntimeError, r"GraphQL.*attempts=3.*elapsed=.*request_id=FINAL:123"):
+            self.client.graphql(self.query, self.variables)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.5), mock.call(1.0)])
+
+    def test_semantic_mixed_and_malformed_errors_do_not_retry(self):
+        internal = {"type": "INTERNAL", "message": "Internal server error"}
+        cases = [
+            {"errors": [{"message": "bad query"}]},
+            {"errors": [{"type": "FORBIDDEN", "message": "Resource not accessible"}]},
+            {"errors": [{"type": "FORBIDDEN", "message": self.internal_message}]},
+            {"errors": [internal, {"type": "GRAPHQL_VALIDATION_FAILED"}]},
+            {"errors": [internal, None]},
+            {"errors": []}, {"errors": "internal error"},
+            {"data": []}, {"data": "not an object"}, None, [],
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload), \
+                 mock.patch.object(self.client, "installation_token", return_value="tok"), \
+                 mock.patch.object(self.client, "_request", return_value=(200, payload, {})) as request, \
+                 mock.patch("app.github.time.sleep") as sleep:
+                with self.assertRaises(RuntimeError):
+                    self.client.graphql(self.query, self.variables)
+            request.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_partial_not_found_data_remains_usable_without_retry(self):
+        data = {"nodes": [{"id": "R1"}, None]}
+        with mock.patch.object(self.client, "installation_token", return_value="tok"), \
+             mock.patch.object(self.client, "_request", return_value=(
+                 200, {"data": data, "errors": [{"type": "NOT_FOUND", "path": ["nodes", 1]}]}, {})) as request, \
+             mock.patch("app.github.time.sleep") as sleep:
+            self.assertEqual(self.client.graphql(self.query, self.variables), data)
+        request.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_auth_and_rate_failures_are_classified_without_inline_retry(self):
+        cases = [
+            (401, {"message": "Bad credentials"}, AuthError),
+            (403, {"message": "API rate limit exceeded"}, RateLimited),
+            (429, {"message": "Too many requests"}, RateLimited),
+            (200, {"errors": [{"type": "RATE_LIMITED", "message": "quota reached"}]}, RateLimited),
+            (200, {"data": {"nodes": None}, "errors": [{"type": "RATE_LIMITED"}]}, RateLimited),
+        ]
+        for status, payload, expected in cases:
+            self.client._token = "cached-token"
+            with self.subTest(status=status, payload=payload), \
+                 mock.patch.object(self.client, "installation_token", return_value="tok"), \
+                 mock.patch.object(self.client, "_request", return_value=(status, payload, {})) as request, \
+                 mock.patch("app.github.time.sleep") as sleep:
+                with self.assertRaises(expected) as caught:
+                    self.client.graphql(self.query, self.variables)
+            self.assertIn("attempts=1", str(caught.exception))
+            request.assert_called_once()
+            sleep.assert_not_called()
+            if expected is AuthError:
+                self.assertIsNone(self.client._token)
 
     def test_other_validation_error_preserves_structured_diagnostic_details(self):
         client = GitHub()

@@ -30,7 +30,10 @@ def error_guidance(message):
                                      "remote end closed", "name resolution", "urlopen error", "network down")):
         return {"summary": "连接 GitHub 失败，本次检查或同步未完成。",
                 "action": "后台会自动重试；仓库同步失败通常约 10 分钟后再试，持续失败时请检查服务器网络。"}
-    if re.search(r"(?:\bhttp(?:\s+error)?\s*|->\s*|['\"]status['\"]:\s*['\"]?)(?:500|502|503|504)\b", text):
+    if ("graphql 内部服务异常" in text or
+            ("graphql errors:" in text and "something went wrong while executing your query on " in text
+             and "when reporting this issue." in text) or
+            re.search(r"(?:\bhttp(?:\s+error)?\s*|->\s*|['\"]status['\"]:\s*['\"]?)(?:500|502|503|504)\b", text)):
         return {"summary": "GitHub 服务暂时异常，本次检查或同步未完成。",
                 "action": "后台会自动重试；仓库同步失败通常约 10 分钟后再试，无需修改仓库或权限。"}
     return None

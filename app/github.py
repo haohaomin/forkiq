@@ -20,6 +20,19 @@ GRAPHQL_RETRY_STATUSES = frozenset((502, 503, 504))
 # not get stuck behind one unhealthy upstream edge.
 GRAPHQL_MAX_ATTEMPTS = 3
 GRAPHQL_RETRY_BACKOFF_SECONDS = 0.5
+_GRAPHQL_INTERNAL_MESSAGE = re.compile(
+    r"Something went wrong while executing your query on "
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\. "
+    r"Please include `[A-Za-z0-9:_-]+` when reporting this issue\.")
+
+
+def _graphql_internal_error(error):
+    if not isinstance(error, dict):
+        return False
+    if error.get("type") == "INTERNAL":
+        return True
+    return (not error.get("type") and
+            bool(_GRAPHQL_INTERNAL_MESSAGE.fullmatch(str(error.get("message", "")))))
 
 
 class RateLimited(RuntimeError):
@@ -373,25 +386,44 @@ class GitHub:
             status, payload, response_headers = self._request(
                 "POST", GRAPHQL, headers,
                 {"query": query, "variables": variables})
-            if status in GRAPHQL_RETRY_STATUSES and attempt < GRAPHQL_MAX_ATTEMPTS:
+            data = payload.get("data") if isinstance(payload, dict) else None
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            # GitHub can report an internal execution failure with HTTP 200.
+            # Retry only an entirely failed query with explicit internal errors;
+            # mixed, validation and permission errors must not be replayed.
+            internal = (status == 200 and data is None and isinstance(errors, list)
+                        and bool(errors) and all(_graphql_internal_error(e) for e in errors))
+            context = [f"attempts={attempt}",
+                       f"elapsed={time.monotonic() - started:.2f}s"]
+            request_id = next(
+                (str(value) for key, value in (response_headers or {}).items()
+                 if str(key).lower() == "x-github-request-id" and value), None)
+            if request_id:
+                context.append(f"request_id={request_id[:100]}")
+            diagnostic = f"({', '.join(context)})"
+            message = str(payload.get("message", "")) if isinstance(payload, dict) else ""
+            rate_limited = (status == 429 or
+                            (status in (401, 403) and "rate limit" in message.lower()) or
+                            (isinstance(errors, list) and any(
+                                isinstance(e, dict) and e.get("type") == "RATE_LIMITED"
+                                for e in errors)))
+            if rate_limited:
+                raise RateLimited(f"GraphQL 限流 -> {status}: {str(payload)[:300]} {diagnostic}")
+            if status == 401:
+                self.reset_token()
+                raise AuthError(f"GraphQL 认证失败 -> 401: {str(payload)[:300]} {diagnostic}")
+            if (status in GRAPHQL_RETRY_STATUSES or internal) and attempt < GRAPHQL_MAX_ATTEMPTS:
                 time.sleep(GRAPHQL_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
                 continue
             if status != 200:
-                detail = f"GraphQL -> {status}: {str(payload)[:300]}"
-                context = [f"attempts={attempt}",
-                           f"elapsed={time.monotonic() - started:.2f}s"]
-                request_id = next(
-                    (str(value) for key, value in (response_headers or {}).items()
-                     if str(key).lower() == "x-github-request-id" and value),
-                    None)
-                if request_id:
-                    context.append(f"request_id={request_id[:100]}")
-                raise RuntimeError(f"{detail} ({', '.join(context)})")
+                raise RuntimeError(f"GraphQL -> {status}: {str(payload)[:300]} {diagnostic}")
             if not isinstance(payload, dict):
-                raise RuntimeError(f"GraphQL 响应无效 (attempts={attempt})")
-            data = payload.get("data")
+                raise RuntimeError(f"GraphQL 响应无效 {diagnostic}")
             if data is None:
-                raise RuntimeError(f"GraphQL errors: {str(payload.get('errors'))[:300]}")
+                label = "GraphQL 内部服务异常" if internal else "GraphQL errors"
+                raise RuntimeError(f"{label}: {str(errors)[:300]} {diagnostic}")
+            if not isinstance(data, dict):
+                raise RuntimeError(f"GraphQL 响应无效 {diagnostic}")
             # Partial errors (e.g. one node id unresolvable) still return usable
             # data with nulls at the failed positions; callers skip null nodes.
             return data

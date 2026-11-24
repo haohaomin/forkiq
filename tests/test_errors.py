@@ -29,6 +29,17 @@ class ErrorGuidanceTests(unittest.TestCase):
     def test_rate_limiting_does_not_encourage_repeated_requests(self):
         self.assertIn("不会加快", error_guidance("API rate limit exceeded")["action"])
 
+    def test_graphql_internal_failure_gets_service_guidance(self):
+        messages = (
+            "GraphQL errors: [{'message': 'Something went wrong while executing your query on "
+            "2026-11-23T21:40:55Z. Please include `ABC:123` when reporting this issue.'}]",
+            "GraphQL 内部服务异常：{'type': 'INTERNAL'} (attempts=3, elapsed=1.50s)",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertIn("服务暂时异常", error_guidance(message)["summary"])
+                self.assertIn("自动重试", error_guidance(message)["action"])
+
     def test_inaccessible_repo_does_not_claim_it_was_deleted(self):
         self.assertIn("不能确定", error_guidance("GitHub App 无法访问此仓库")["action"])
 
