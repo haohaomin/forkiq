@@ -31,6 +31,9 @@ sudo docker compose --env-file /etc/forkiq/compose.env \
 
 ## 运维与升级
 
+部署模板启用 `init: true`，回收 Git 操作结束或超时后遗留的孤儿子进程，
+避免僵尸进程持续占用进程配额；容器的 `pids_limit` 保持为 `128`。
+
 ```sh
 sudo docker compose --env-file /etc/forkiq/compose.env \
   -p forkiq -f /opt/forkiq/deploy/compose.oci.yml ps

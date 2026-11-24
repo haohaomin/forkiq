@@ -5,6 +5,7 @@ services:
       dockerfile: deploy/Dockerfile
     image: forkiq:local
     restart: unless-stopped
+    init: true
     environment:
       FORKIQ_PUBLIC_URL: ${FORKIQ_PUBLIC_URL:?Set the public HTTPS origin}
       FORWARDED_ALLOW_IPS: ${FORKIQ_PROXY_IP:?Set the Caddy container IP}
