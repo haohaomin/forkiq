@@ -122,6 +122,38 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(self.fetcher.call_count, 1)
         self.assertEqual(len(self.records()), 1)
 
+    def test_delete_rechecks_current_repository_identity_and_restore_usage(self):
+        record = self.backup()
+        bundle = self.assert_ready(record)
+        self.db.run("DELETE FROM repositories WHERE id=?", (self.repo_id,))
+        new_id = insert_repository(self.db, owner="me", name="demo", full_name="me/demo",
+                                   upstream_full_name="up/demo")
+        original_run = self.db.run
+        for concurrent in ("restore", "remove"):
+            with self.subTest(concurrent=concurrent):
+                def race_before_delete(sql, params=()):
+                    if sql.startswith("DELETE FROM repository_backups"):
+                        if concurrent == "restore":
+                            original_run("UPDATE repositories SET restore_backup_id=? WHERE id=?",
+                                         (record["id"], new_id))
+                        else:
+                            original_run("DELETE FROM repositories WHERE id=?", (new_id,))
+                    return original_run(sql, params)
+                with mock.patch.object(self.db, "run", side_effect=race_before_delete):
+                    with self.assertRaises(backups.BackupError):
+                        backups.delete_backup(self.db, record["id"], new_id)
+                self.assertTrue(backups.verified_backup(self.db, record))
+                self.assertTrue(bundle.exists())
+                self.assertIsNotNone(self.db.one("SELECT id FROM repository_backups WHERE id=?", (record["id"],)))
+                original_run("UPDATE repositories SET restore_backup_id=NULL WHERE id=?", (new_id,))
+
+    def test_unscoped_delete_also_preserves_a_backup_queued_for_restore(self):
+        record = self.backup()
+        self.db.run("UPDATE repositories SET restore_backup_id=? WHERE id=?", (record["id"], self.repo_id))
+        with self.assertRaises(backups.BackupError):
+            backups.delete_backup(self.db, record["id"])
+        self.assert_ready(record)
+
     def test_missing_ready_file_is_rebuilt_using_same_record(self):
         first = self.backup()
         self.assert_ready(first).unlink()

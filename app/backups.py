@@ -177,7 +177,11 @@ def delete_backup(db, backup_id, repo_id=None):
         raise BackupError("备份目录缺失或无法访问，未删除记录") from None
     with _locked(root):
         record = db.one("SELECT * FROM repository_backups WHERE id=?", (backup_id,))
-        if record is None or (repo_id is not None and record["repo_id"] != repo_id):
+        repo = db.one("SELECT full_name FROM repositories WHERE id=?", (repo_id,)) if repo_id is not None else None
+        # Backups outlive managed rows: removing and re-adding the same GitHub
+        # repository gives it a new local id without changing its snapshots.
+        if record is None or (repo_id is not None and
+                              (repo is None or record["full_name"] != repo["full_name"])):
             raise BackupError("备份不存在")
         path = backup_path(db, record)
         if path.is_symlink() or not path.is_file():
@@ -188,12 +192,17 @@ def delete_backup(db, backup_id, repo_id=None):
         os.replace(path, temporary)
         try:
             if repo_id is None:
-                deleted = db.run("DELETE FROM repository_backups WHERE id=?", (backup_id,)).rowcount
+                deleted = db.run(
+                    "DELETE FROM repository_backups WHERE id=? "
+                    "AND NOT EXISTS (SELECT 1 FROM repositories WHERE restore_backup_id=?)",
+                    (backup_id, backup_id)).rowcount
             else:
                 deleted = db.run(
-                    "DELETE FROM repository_backups WHERE id=? AND repo_id=? "
-                    "AND NOT EXISTS (SELECT 1 FROM repositories WHERE id=? AND restore_backup_id=?)",
-                    (backup_id, repo_id, repo_id, backup_id)).rowcount
+                    "DELETE FROM repository_backups WHERE id=? "
+                    "AND EXISTS (SELECT 1 FROM repositories WHERE id=? "
+                    "AND full_name=repository_backups.full_name) "
+                    "AND NOT EXISTS (SELECT 1 FROM repositories WHERE restore_backup_id=?)",
+                    (backup_id, repo_id, backup_id)).rowcount
             if not deleted:
                 raise BackupError("备份正在回滚或已被删除，请刷新后重试")
         except Exception:

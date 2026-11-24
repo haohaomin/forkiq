@@ -658,7 +658,7 @@ def delete_backup_request(request: Request, repo_id: int, backup_id: int,
         return denied
     repo = db.one("SELECT * FROM repositories WHERE id=?", (repo_id,))
     record = db.one("SELECT * FROM repository_backups WHERE id=?", (backup_id,))
-    if repo is None or record is None or record["repo_id"] != repo_id or record["full_name"] != repo["full_name"]:
+    if repo is None or record is None or record["full_name"] != repo["full_name"]:
         return JSONResponse({"error": "仓库备份不存在"}, status_code=404)
     if repo["restore_backup_id"] == backup_id:
         return JSONResponse({"error": "回滚正在使用这份备份，暂时不能删除"}, status_code=409)

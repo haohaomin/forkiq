@@ -1936,6 +1936,33 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertIsNotNone(self.main.db.one("SELECT * FROM repository_backups WHERE id=?", (record["id"],)))
 
+    def test_readded_repository_can_delete_its_retained_backup_but_not_another_repos(self):
+        from app.db import insert_repository
+        from app.backups import backup_path, ensure_backup
+        token = self.setup_admin()
+        old_id, record = self.repository_with_backup()
+        bundle = backup_path(self.main.db, record)
+        self.client.post(f"/repos/{old_id}/remove", data={"csrf": self.csrf(token)})
+        new_id = insert_repository(self.main.db, owner="me", name="demo", full_name="me/demo",
+                                   upstream_full_name="up/demo", node_id="N1")
+        other_id = insert_repository(self.main.db, owner="me", name="other", full_name="me/other",
+                                     upstream_full_name="up/other")
+        self.assertNotEqual(old_id, new_id)
+        row = self.main.db.one("SELECT * FROM repositories WHERE id=?", (new_id,))
+        reused = ensure_backup(self.main.db, mock.Mock(), row, record["fork_sha"])
+        self.assertEqual((reused["id"], reused["repo_id"]), (record["id"], old_id))
+        url = f"/repos/{new_id}/backups/{record['id']}/delete"
+        self.assertIn(url, self.client.get(f"/repos/{new_id}").text)
+        self.assertEqual(self.client.post(f"/repos/{other_id}/backups/{record['id']}/delete",
+                                          data={"csrf": self.csrf(token)}).status_code, 404)
+        self.main.db.run("UPDATE repositories SET restore_backup_id=? WHERE id=?", (record["id"], new_id))
+        self.assertEqual(self.client.post(url, data={"csrf": self.csrf(token)}).status_code, 409)
+        self.assertTrue(bundle.exists())
+        self.main.db.run("UPDATE repositories SET restore_backup_id=NULL WHERE id=?", (new_id,))
+        self.assertEqual(self.client.post(url, data={"csrf": self.csrf(token)}).status_code, 302)
+        self.assertFalse(bundle.exists())
+        self.assertIsNone(self.main.db.one("SELECT * FROM repository_backups WHERE id=?", (record["id"],)))
+
     def test_restore_preview_reads_current_head_and_renders_csrf_confirmation_without_mutation(self):
         token = self.setup_admin()
         repo_id, record = self.repository_with_backup()
