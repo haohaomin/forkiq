@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import engine
 from app.db import DB, insert_repository
-from app.github import RefNotFastForward, RefNotFound, RefObjectNotFound
+from app.github import Forbidden, RefNotFastForward, RefNotFound, RefObjectNotFound
 
 
 def node(node_id, fork_full, upstream_full, fork_sha, upstream_sha, branch="main",
@@ -209,6 +209,94 @@ class EngineTests(unittest.TestCase):
         self.db.run("UPDATE repositories SET last_check_at=?, sync_requested=0 WHERE id=?", (due, self.repo_id))
         engine.run_cycle(self.db, self.client)
         self.assertTrue(any(call[0] == "graphql" for call in self.client.calls))
+
+    def test_controls_changed_during_final_head_read_cancel_pending_sync(self):
+        for change in ("pause", "protect", "restore", "remove"):
+            with self.subTest(change=change):
+                self.db.run("UPDATE repositories SET mode='safe',enabled=1,status='pending',"
+                            "restore_backup_id=NULL,restore_expected_sha=NULL WHERE id=?", (self.repo_id,))
+                self.client.calls.clear()
+                self.client.nodes["N1"] = node("N1", "me/demo", "up/demo", "a" * 40, "b" * 40)
+                original = self.client.get_ref
+                reads = 0
+                def get_ref(name, branch):
+                    nonlocal reads
+                    reads += 1
+                    if reads == 3:
+                        if change == "remove":
+                            self.db.run("DELETE FROM repositories WHERE id=?", (self.repo_id,))
+                        else:
+                            mode = "protected" if change == "protect" else "safe"
+                            backup_id = 7 if change == "restore" else None
+                            self.db.run("UPDATE repositories SET mode=?,enabled=0,status='paused',"
+                                        "restore_backup_id=? WHERE id=?", (mode, backup_id, self.repo_id))
+                    return original(name, branch)
+                with mock.patch.object(self.client, "get_ref", side_effect=get_ref):
+                    engine.run_cycle(self.db, self.client)
+                self.assertFalse(any(c[0] == "update_ref" for c in self.client.calls))
+                if change == "remove":
+                    self.assertIsNone(self.row())
+                else:
+                    self.assertEqual(self.row()["status"], "paused")
+                    self.assertEqual(self.row()["enabled"], 0)
+                    if change == "protect":
+                        self.assertEqual(self.row()["mode"], "protected")
+                    if change == "restore":
+                        self.assertEqual(self.row()["restore_backup_id"], 7)
+
+    def test_enabling_deletion_protection_during_final_head_read_blocks_empty_target(self):
+        self.db.run("UPDATE repositories SET deletion_protection=0 WHERE id=?", (self.repo_id,))
+        self.client.nodes["N1"] = node("N1", "me/demo", "up/demo", "a" * 40, "b" * 40)
+        self.client.file_trees["me/demo", "a" * 40] = {"important.txt"}
+        self.client.file_trees["up/demo", "b" * 40] = set()
+        original = self.client.get_ref
+        reads = 0
+        def get_ref(name, branch):
+            nonlocal reads
+            reads += 1
+            if reads == 3:
+                self.db.run("UPDATE repositories SET deletion_protection=1 WHERE id=?", (self.repo_id,))
+            return original(name, branch)
+        with mock.patch.object(self.client, "get_ref", side_effect=get_ref):
+            engine.run_cycle(self.db, self.client)
+        self.assertFalse(any(c[0] == "update_ref" for c in self.client.calls))
+        self.assertEqual(self.row()["status"], "needs_attention")
+        self.assertIn("保护配置已变化", self.row()["last_error"])
+        # The next pass evaluates the new policy and blocks the empty tree too.
+        engine.run_cycle(self.db, self.client)
+        self.assertFalse(any(c[0] == "update_ref" for c in self.client.calls))
+        self.assertIn("上游目标文件树为空", self.row()["last_error"])
+
+    def test_inflight_sync_result_cannot_overwrite_user_controls(self):
+        for change in ("pause", "protect", "restore"):
+            for failure in (None, RuntimeError("gateway failed after dispatch"),
+                            Forbidden("Resource not accessible"), RefNotFastForward("not a fast forward")):
+                with self.subTest(change=change, failure=failure):
+                    self.db.run("UPDATE repositories SET mode='safe',enabled=1,status='pending',"
+                                "restore_backup_id=NULL,last_error=NULL WHERE id=?", (self.repo_id,))
+                    self.db.run("DELETE FROM events")
+                    self.client.calls.clear()
+                    self.client.refs["me/demo"] = "a" * 40
+                    self.client.nodes["N1"] = node("N1", "me/demo", "up/demo", "a" * 40, "b" * 40)
+                    original = self.client.update_ref
+                    def update_ref(*args, **kwargs):
+                        mode = "protected" if change == "protect" else "safe"
+                        self.db.run("UPDATE repositories SET mode=?,enabled=0,status='paused',"
+                                    "restore_backup_id=?,last_error='user control' WHERE id=?",
+                                    (mode, 7 if change == "restore" else None, self.repo_id))
+                        if failure:
+                            raise failure
+                        return original(*args, **kwargs)
+                    with mock.patch.object(self.client, "update_ref", side_effect=update_ref):
+                        engine.run_cycle(self.db, self.client)
+                    self.assertEqual(self.row()["status"], "paused")
+                    self.assertEqual(self.row()["enabled"], 0)
+                    self.assertEqual(self.row()["last_error"], "user control")
+                    self.assertFalse(self.db.all("SELECT * FROM events WHERE kind IN ('synced','error')"))
+                    if change == "protect":
+                        self.assertEqual(self.row()["mode"], "protected")
+                    if change == "restore":
+                        self.assertEqual(self.row()["restore_backup_id"], 7)
 
     def test_cycle_records_tags_and_commit_dates(self):
         # The version columns come from the same batched GraphQL node: the
@@ -792,13 +880,41 @@ class PersonalCommitProtectionTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "merge_commit" for c in self.client.calls))
         self.assertFalse(self.client.forced_refs)
 
-    def test_compare_failure_blocks_even_with_deletion_protection_disabled(self):
+    def test_compare_failure_retries_without_switching_mode_or_bypassing_protection(self):
         self.db.run("UPDATE repositories SET deletion_protection=0")
         self.client.nodes["N1"] = node("N1", "me/demo", "up/demo", "a"*40, "b"*40)
         self.client.compare_error = True
         engine.run_cycle(self.db, self.client)
-        self.assertEqual(self.row()["mode"], "protected")
+        self.assertEqual((self.row()["mode"], self.row()["enabled"], self.row()["status"]),
+                         ("safe", 1, "error"))
+        self.assertIn("提交比较请求失败", self.row()["last_error"])
         self.assertFalse(any(c[0] == "update_ref" for c in self.client.calls))
+        self.client.compare_error = False
+        self.client.compare_result = {"ahead_by": 9, "behind_by": 0}
+        self.client.calls.clear()
+        # Recovery respects the ten-minute error backoff before checking again.
+        engine.run_cycle(self.db, self.client)
+        self.assertFalse(any(c[0] in ("compare", "update_ref") for c in self.client.calls))
+        self.db.run("UPDATE repositories SET last_check_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+                    (self.repo_id,))
+        engine.run_cycle(self.db, self.client)
+        self.assertEqual((self.row()["mode"], self.row()["status"], self.row()["fork_sha"]),
+                         ("safe", "synced", "b" * 40))
+        self.assertEqual(self.client.forced_refs, [])
+
+    def test_compare_failure_cannot_replace_a_concurrent_protect_request(self):
+        self.client.nodes["N1"] = node("N1", "me/demo", "up/demo", "a" * 40, "b" * 40)
+        def unavailable(*args):
+            self.db.run("UPDATE repositories SET mode='protected',enabled=0,status='paused',"
+                        "last_error='user protection' WHERE id=?", (self.repo_id,))
+            raise RuntimeError("GitHub GET compare -> 502")
+        with mock.patch.object(self.client, "compare", side_effect=unavailable):
+            engine.run_cycle(self.db, self.client)
+        self.assertEqual((self.row()["mode"], self.row()["enabled"], self.row()["status"]),
+                         ("protected", 0, "paused"))
+        self.assertEqual(self.row()["last_error"], "user protection")
+        self.assertFalse(any(c[0] == "update_ref" for c in self.client.calls))
+        self.assertFalse(self.db.all("SELECT * FROM events WHERE kind='error'"))
 
 
 class SelfUpdateTests(unittest.TestCase):

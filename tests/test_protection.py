@@ -214,8 +214,8 @@ class ProtectionTests(unittest.TestCase):
                 self.client.compare_result, self.client.compare_error = result, error
                 self.configure(mode="manual", enabled=1, status="pending", deletion_review=None, last_error=None)
                 engine.run_cycle(self.db, self.client)
-                self.assertEqual(self.row()["status"], "paused")
-                self.assertEqual(self.row()["mode"], "protected")
+                self.assertEqual(self.row()["status"], "error" if error else "paused")
+                self.assertEqual(self.row()["mode"], "manual" if error else "protected")
                 self.assert_no_mutations()
                 self.assertIsNone(load_review(self.row()))
 

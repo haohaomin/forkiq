@@ -94,6 +94,23 @@ def _set_repo(db, repo_id, **fields):
     db.run(f"UPDATE repositories SET {columns} WHERE id=?", (*fields.values(), repo_id))
 
 
+def _set_sync_result(db, row, **fields):
+    """Do not overwrite controls changed while a GitHub request was in flight."""
+    fields["updated_at"] = utcnow()
+    columns = ", ".join(f"{key}=?" for key in fields)
+    return bool(db.run(
+        f"UPDATE repositories SET {columns} WHERE id=? AND enabled=1 "
+        "AND status<>'paused' AND restore_backup_id IS NULL AND mode=? "
+        "AND branch=? AND full_name=? AND upstream_full_name IS ?",
+        (*fields.values(), row["id"], row["mode"], row["branch"],
+         row["full_name"], row["upstream_full_name"])).rowcount)
+
+
+def _current_status(db, row):
+    live = db.one("SELECT status FROM repositories WHERE id=?", (row["id"],))
+    return live["status"] if live else "paused"
+
+
 def _latest_tag(ref):
     """Newest tag name reachable from a ref, or None when the ref has no tags.
 
@@ -263,9 +280,11 @@ def add_manual(db, client, url):
 
 
 def _mark_diverged(db, row, upstream_sha, message, version=None):
-    _set_repo(db, row["id"], status="diverged", diverged_at=utcnow(),
-              diverged_upstream_sha=upstream_sha, last_error=message, **(version or {}))
-    log_event(db, row["id"], "blocked", f"{row['full_name']} {message}")
+    changed = _set_sync_result(db, row, status="diverged", diverged_at=utcnow(),
+                               diverged_upstream_sha=upstream_sha, last_error=message, **(version or {}))
+    if changed:
+        log_event(db, row["id"], "blocked", f"{row['full_name']} {message}")
+    return changed
 
 
 def _merge_retry_due(row):
@@ -543,14 +562,27 @@ def _deletion_guard(db, client, row, fork_sha, target_sha, comparison=None):
         if fatal:
             raise fatal
         return False
+    try:
+        # This network read can take seconds. Read the controls afterwards so
+        # a pause, restore or policy change during it cancels the pending write.
+        if not review["error"] and client.get_ref(row["full_name"], row["branch"]) != fork_sha:
+            raise RuntimeError("备份期间 fork HEAD 已变化，请重新检查")
+    except Exception as error:
+        review = {"identity": change_identity(row, fork_sha, target_sha),
+                  "error": str(error)[:500], "reasons": []}
+        if isinstance(error, (RateLimited, AuthError)):
+            fatal = error
     latest = db.one("SELECT * FROM repositories WHERE id=?", (row["id"],))
-    if not latest or not latest["enabled"] or latest["status"] == "paused":
+    if (not latest or not latest["enabled"] or latest["status"] == "paused"
+            or latest["restore_backup_id"] is not None
+            or any(latest[key] != row[key] for key in
+                   ("mode", "branch", "full_name", "upstream_full_name"))):
+        if fatal:
+            raise fatal
         return False
     try:
-        if not review["error"] and (client.get_ref(row["full_name"], row["branch"]) != fork_sha or
-                deletion_policy(db, latest) != policy or
-                any(latest[key] != row[key] for key in ("mode", "branch", "upstream_full_name"))):
-            raise RuntimeError("备份期间 fork HEAD 或同步配置已变化，请重新检查")
+        if not review["error"] and deletion_policy(db, latest) != policy:
+            raise RuntimeError("备份期间保护配置已变化，请重新检查")
     except Exception as error:
         review = {"identity": change_identity(row, fork_sha, target_sha),
                   "error": str(error)[:500], "reasons": []}
@@ -558,8 +590,7 @@ def _deletion_guard(db, client, row, fork_sha, target_sha, comparison=None):
             fatal = error
     serialized = review_json(review)
     if not review["error"] and not review["reasons"]:
-        _set_repo(db, row["id"], deletion_review=serialized, deletion_approval=None)
-        return True
+        return _set_sync_result(db, row, deletion_review=serialized, deletion_approval=None)
     if not review["error"]:
         token = review_token(review)
         consumed = db.run("UPDATE repositories SET deletion_approval=NULL WHERE id=? "
@@ -611,7 +642,7 @@ def _sync_manual(db, client, row, fork_branch, fork_sha, upstream_sha, now, forc
     repo_id = row["id"]
     version = version or {}
     if not _fast_forward_guard(db, client, row, fork_sha, upstream_sha):
-        return "paused"
+        return _current_status(db, row)
     if fork_sha == upstream_sha:
         # Same commit: both sides agree, so both counts are zero.
         version = {**version, "upstream_ahead": 0, "fork_ahead": 0}
@@ -740,27 +771,31 @@ def _classify_forbidden(db, client, row, upstream_sha, error, version=None):
         payload = "probe-failed"
     version = {**(version or {}), **_count_fields(payload)}
     if payload is None:
-        _mark_diverged(db, row, upstream_sha, "与上游无共同祖先（历史被重写），不会覆盖", version)
-        return "diverged"
+        if _mark_diverged(db, row, upstream_sha, "与上游无共同祖先（历史被重写），不会覆盖", version):
+            return "diverged"
+        return _current_status(db, row)
     if isinstance(payload, dict):
         unique = payload.get("behind_by", 0)
         if unique > 0:
-            _mark_diverged(db, row, upstream_sha, f"有 {unique} 个独有提交，不会覆盖", version)
-            return "diverged"
+            if _mark_diverged(db, row, upstream_sha, f"有 {unique} 个独有提交，不会覆盖", version):
+                return "diverged"
+            return _current_status(db, row)
         files = payload.get("files") or []
         if any(str(f.get("filename", "")).startswith(".github/workflows/") for f in files):
             message = ("待同步提交含 .github/workflows/ 变更，App 缺 Workflows 权限被拒："
                        "在 GitHub App 设置授予 Workflows 读写并批准后自动恢复")
+            if not _set_sync_result(db, row, status="error", last_check_at=utcnow(),
+                                    last_error=message, **version):
+                return _current_status(db, row)
             if row["status"] != "error" or row["last_error"] != message:
                 log_event(db, row["id"], "error", f"{row['full_name']} 同步失败：{message}")
-            _set_repo(db, row["id"], status="error", last_check_at=utcnow(),
-                      last_error=message, **version)
             return "error"
     message = f"推送被 GitHub 拒绝（403）：{str(error)[:200]}"
+    if not _set_sync_result(db, row, status="error", last_check_at=utcnow(), last_error=message,
+                            **version):
+        return _current_status(db, row)
     if row["status"] != "error" or row["last_error"] != message:
         log_event(db, row["id"], "error", f"{row['full_name']} 同步失败：{message}")
-    _set_repo(db, row["id"], status="error", last_check_at=utcnow(), last_error=message,
-              **version)
     return "error"
 
 
@@ -779,7 +814,10 @@ def _protect_repository(db, row, message, fork_sha=None, upstream_sha=None, coun
     if upstream_sha:
         fields["upstream_sha"] = upstream_sha
     fields.update(counts or {})
-    _set_repo(db, row["id"], **fields)
+    if row["mode"] == "protected":
+        _set_repo(db, row["id"], **fields)
+    elif not _set_sync_result(db, row, **fields):
+        return _current_status(db, row)
     if row["mode"] != "protected" or row["last_error"] != message:
         log_event(db, row["id"], "blocked", f"{row['full_name']} {message}")
     return "paused"
@@ -793,8 +831,15 @@ def _fast_forward_guard(db, client, row, fork_sha, upstream_sha):
         comparison = client.compare(row["full_name"], fork_sha, upstream_sha)
     except (AuthError, RateLimited):
         raise
-    except Exception:
-        comparison = None
+    except Exception as error:
+        # Transport/API failures say nothing about commit ancestry. Keep the
+        # selected mode and fail this cycle; the usual error backoff retries it.
+        message = f"提交比较请求失败，本次未同步，稍后重试：{str(error)[:240]}"
+        if _set_sync_result(db, row, status="error", last_check_at=utcnow(),
+                            last_error=message, fork_sha=fork_sha, upstream_sha=upstream_sha):
+            if row["status"] != "error" or row["last_error"] != message:
+                log_event(db, row["id"], "error", f"{row['full_name']} {message}")
+        return False
     if not valid_comparison(comparison):
         _protect_repository(db, row, "无法确认提交包含关系，已禁止自动同步；请人工检查历史。",
                             fork_sha, upstream_sha)
@@ -936,7 +981,7 @@ def sync_one(db, client, row, node, forced=False):
         return align_upstream(db, client, row, fork_sha, upstream_sha,
                               deletion_guard=_deletion_guard)
     if not _fast_forward_guard(db, client, row, fork_sha, upstream_sha):
-        return "paused"
+        return _current_status(db, row)
     if not _deletion_guard(db, client, row, fork_sha, upstream_sha):
         return "needs_attention"
     try:
@@ -952,7 +997,7 @@ def sync_one(db, client, row, node, forced=False):
                            "fork_commit_at": None, "upstream_commit_at": None}
             upstream_sha = refreshed_sha
             if not _fast_forward_guard(db, client, row, fork_sha, upstream_sha):
-                return "paused"
+                return _current_status(db, row)
             if not _deletion_guard(db, client, row, fork_sha, upstream_sha):
                 return "needs_attention"
             _update_fast_forward(client, row, upstream_sha, fork_sha)
@@ -960,11 +1005,12 @@ def sync_one(db, client, row, node, forced=False):
         confirmed = client.get_ref(row["full_name"], row["branch"])
         if confirmed != upstream_sha:
             raise RuntimeError(f"推送后 fork HEAD {confirmed[:12]} 与目标 {upstream_sha[:12]} 不一致")
-        _set_repo(db, repo_id, status="synced", fork_sha=upstream_sha, upstream_sha=upstream_sha,
-                  upstream_ahead=0, fork_ahead=0,
-                  last_check_at=utcnow(), last_success_at=utcnow(), last_error=None,
-                  deletion_review=None, deletion_approval=None,
-                  diverged_at=None, diverged_upstream_sha=None, **version)
+        if not _set_sync_result(db, row, status="synced", fork_sha=upstream_sha, upstream_sha=upstream_sha,
+                                upstream_ahead=0, fork_ahead=0,
+                                last_check_at=utcnow(), last_success_at=utcnow(), last_error=None,
+                                deletion_review=None, deletion_approval=None,
+                                diverged_at=None, diverged_upstream_sha=None, **version):
+            return _current_status(db, row)
         message = f"{row['full_name']} 快进到 {upstream_sha[:12]}"
         if recovered_object:
             message += "（已刷新上游提交并自动恢复）"
@@ -978,10 +1024,11 @@ def sync_one(db, client, row, node, forced=False):
         raise
     except Exception as error:  # per-repo isolation: other repos continue
         message = str(error)[:300]
+        if not _set_sync_result(db, row, status="error", last_check_at=utcnow(), last_error=message,
+                                **version):
+            return _current_status(db, row)
         if row["status"] != "error" or row["last_error"] != message:
             log_event(db, repo_id, "error", f"{row['full_name']} 同步失败：{message}")
-        _set_repo(db, repo_id, status="error", last_check_at=utcnow(), last_error=message,
-                  **version)
         return "error"
 
 
